@@ -35,8 +35,13 @@ KYTY_BACKEND=metal KYTY_MSL_ONLY=1 KYTY_MSL_GDS=1 KYTY_VIDEO_OUT_1080P=1 \
 ```
 
 On a Mac mini M4 with 16 GiB and macOS 27.2.1, *Is This Seat Taken?*
-(PPSA37001) reached its title menu. The Metal presenter readback at frame 600 showed
-the title and menu with a large purple rendering artifact. Gameplay and regression
-coverage for other titles are unverified. The native attribute path is limited to
-supported unswizzled descriptors and a bounded range of argument buffer slots.
-Cross-thread exception delivery on this Darwin path is cooperative at guest waits.
+(PPSA37001) reached the title menu, the Barcelona map and the first level.
+Metal frame captures showed readable text and no recurrence of the reported
+purple rectangle or corruption on the first level's Perfect 6/6 results screen.
+The focused vertex layout cache-key regression passed. The full `shader_cfg`
+suite failed the same SPIR-V repeated-export check before and after the fix.
+Audio quality and regression coverage for other titles remain unverified.
+
+The native attribute path supports unswizzled descriptors within a bounded range
+of argument buffer slots. Cross-thread exception delivery on this Darwin path is
+cooperative at guest waits.

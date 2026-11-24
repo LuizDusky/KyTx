@@ -888,6 +888,13 @@ struct Emitter {
 		return declared != 0 ? declared : 8192u;
 	}
 
+	[[nodiscard]] bool UsesDeviceLds() const {
+		const auto* cs = input_info.compute;
+		return program.stage == ShaderType::Compute && cs != nullptr &&
+		       cs->metal_threadgroup_limit_dwords != 0 &&
+		       LdsDwords() > cs->metal_threadgroup_limit_dwords && UsesLds();
+	}
+
 	[[nodiscard]] bool UsesLds() const {
 		for (const auto& info: program.memory_info) {
 			if (info.kind == IR::ResourceKind::Lds || (info.kind == IR::ResourceKind::Gds && !GdsMem(info))) {
@@ -2327,7 +2334,7 @@ struct Emitter {
 				const std::string d     = "(" + LdsByte(inst, mem) + " >> 2)";
 				const std::string value = Expr(inst.Arg(inst.NumArgs() - 2));
 				const std::string cond  = Expr(inst.Arg(inst.NumArgs() - 1));
-				const std::string space = gds ? "device" : "threadgroup";
+				const std::string space = gds || UsesDeviceLds() ? "device" : "threadgroup";
 				const std::string slot  = gds ? "ab.gds[" + d + "]" : "kyty_lds[" + d + "]";
 				body << "\t\t" << Name(inst) << " = 0u;\n";
 				body << "\t\tif (" << cond << " && " << d << " < " << limit << ") {\n";
@@ -2411,7 +2418,9 @@ struct Emitter {
 				     << "\t\t\tuint kyty_old = 0u;\n"
 				     << "\t\t\tif ((lane & 31u) == (kyty_first & 31u) && kyty_cnt != 0u && kyty_ok) {\n"
 				     << "\t\t\t\tkyty_old = atomic_fetch_" << (append ? "add" : "sub") << "_explicit("
-				     << (gds ? "&ab.gds[kyty_idx]" : "(threadgroup atomic_uint*)&kyty_lds[kyty_idx]")
+				     << (gds ? "&ab.gds[kyty_idx]" : UsesDeviceLds() ?
+			                                      "(device atomic_uint*)&kyty_lds[kyty_idx]" :
+			                                      "(threadgroup atomic_uint*)&kyty_lds[kyty_idx]")
 				     << ", kyty_cnt, memory_order_relaxed);\n"
 				     << "\t\t\t}\n"
 				     << "\t\t\t" << Name(inst) << " = simd_shuffle(kyty_old, kyty_first & 31u);\n";
@@ -2444,7 +2453,8 @@ struct Emitter {
 				if (count>1) result+=")";
 				// KYTY_LDS_SYNC=1 (experiment): a wave64 workgroup is two 32-wide host simdgroups that do not run in lockstep, so LDS
 				// handed from one half to the other needs a barrier the RDNA code (one wave, no s_barrier) never had.
-				if (LdsSyncEnabled() && program.stage == ShaderType::Compute) body << "\t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n";
+				if (LdsSyncEnabled() && program.stage == ShaderType::Compute) body << (UsesDeviceLds() ? "\t\tthreadgroup_barrier(mem_flags::mem_device);\n" :
+			                          "\t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n");
 				EmitAssignment(inst,result);
 				return;
 			}
@@ -2496,7 +2506,8 @@ struct Emitter {
 					}
 				}
 				body << "\t\t}\n";
-				if (LdsSyncEnabled() && program.stage == ShaderType::Compute) body << "\t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n";
+				if (LdsSyncEnabled() && program.stage == ShaderType::Compute) body << (UsesDeviceLds() ? "\t\tthreadgroup_barrier(mem_flags::mem_device);\n" :
+			                          "\t\tthreadgroup_barrier(mem_flags::mem_threadgroup);\n");
 				return;
 			}
 			default: EmitAlu(inst); return;
@@ -3250,6 +3261,10 @@ inline float kyty_med3f(float a, float b, float c) {
 			    << "uint3 tid [[thread_position_in_threadgroup]], "
 			    << "uint3 tgid [[threadgroup_position_in_grid]], "
 			    << "uint liid [[thread_index_in_threadgroup]]";
+			if (UsesDeviceLds()) {
+				out << ", uint3 grid_groups [[threadgroups_per_grid]], device uint* lds_backing [[buffer("
+				    << DeviceLdsBufferIndex << ")]]";
+			}
 			if (nan_trace_) out << ", device atomic_uint* kyty_nan_dbg [[buffer(28)]]";
 		}
 		out << ") {\n";
@@ -3260,7 +3275,10 @@ inline float kyty_med3f(float a, float b, float c) {
 	out << "\t(void)ab; (void)pc_data; (void)sizes;\n";
 	if (TracksPixelValidMask()) out << "\tbool kyty_pixel_valid = true;\n";
 	if (UsesLds()) {
-		if (program.stage == ShaderType::Compute) {
+		if (UsesDeviceLds()) {
+			out << "\tconst ulong lds_group = (ulong(tgid.z) * grid_groups.y + tgid.y) * grid_groups.x + tgid.x;\n"
+			    << "\tdevice uint* kyty_lds = lds_backing + lds_group * " << LdsDwords() << "u;\n";
+		} else if (program.stage == ShaderType::Compute) {
 			out << "\tthreadgroup uint kyty_lds[" << LdsDwords() << "];\n";
 		} else {
 			// Non-kernel stages cannot use the threadgroup address space; per-thread
@@ -3506,6 +3524,7 @@ EmitResult EmitProgram(const IR::Program& program, ShaderStageInputInfo input_in
 	EmitResult result;
 	result.source      = emitter.Emit();
 	result.wave64_pair = emitter.pair_;
+	result.device_lds_dwords = emitter.UsesDeviceLds() ? emitter.LdsDwords() : 0u;
 	if (program.stage == ShaderType::Compute) {
 		const auto* cs = ShaderWorkgroupInput(program.stage, emitter.input_info);
 		std::lock_guard<std::mutex> lock(s_pair_mutex);

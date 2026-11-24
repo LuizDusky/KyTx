@@ -1611,6 +1611,10 @@ bool UseNativeMetalBackend() noexcept {
 	return enabled;
 }
 
+uint32_t NativeMetalThreadgroupLimitDwords() {
+	return static_cast<uint32_t>(MetalContext::Instance().GetDevice().maxThreadgroupMemoryLength / sizeof(uint32_t));
+}
+
 MetalRenderer& MetalRenderer::Instance() {
 	static MetalRenderer instance;
 	return instance;
@@ -7023,6 +7027,31 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 	}
 
 	if (pstate == nil) { CountDispatchStat(3); return; }
+	uint32_t tg_w = compute_info.threads_num[0] > 0 ? compute_info.threads_num[0] : 64;
+	uint32_t tg_h = compute_info.threads_num[1] > 0 ? compute_info.threads_num[1] : 1;
+	uint32_t tg_d = compute_info.threads_num[2] > 0 ? compute_info.threads_num[2] : 1;
+	// COMPUTE_DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS: the dispatch dimensions are thread counts, not group counts
+	// (the game's memory fill/copy kernels dispatch one thread per dword). The hardware launches ceil(threads / group size)
+	// groups; taking the counts as groups would run group-size times too many threads per dimension.
+	static const bool s_raw_groups = KYTY_ENV("KYTY_CS_RAW_GROUPS") != nullptr;  // old behaviour, for A/B runs
+	if (indirect_args_addr == 0 && (mode & (1u << 5u)) != 0 && !s_raw_groups  /* COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS */) {
+		thread_group_x = thread_group_x / tg_w + (thread_group_x % tg_w != 0);
+		thread_group_y = thread_group_y / tg_h + (thread_group_y % tg_h != 0);
+		thread_group_z = thread_group_z / tg_d + (thread_group_z % tg_d != 0);
+	}
+	// Guard: clamp group counts to a sane maximum (log when it happens).
+	// KYTY_MAX_GROUPS=<n>: cap on a dispatch's group count per dimension (default 0xFFFFFF).
+	static const uint32_t kMaxGroups = [] {
+	const char* e = KYTY_ENV("KYTY_MAX_GROUPS");
+	return e != nullptr ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0x00FFFFFFu;
+	}();
+	if (thread_group_x > kMaxGroups || thread_group_y > kMaxGroups || thread_group_z > kMaxGroups) {
+		std::fprintf(stderr, "[CsClamp] groups %u,%u,%u clamped to %u\n", thread_group_x, thread_group_y,
+		             thread_group_z, kMaxGroups);
+		thread_group_x = std::min(thread_group_x, kMaxGroups);
+		thread_group_y = std::min(thread_group_y, kMaxGroups);
+		thread_group_z = std::min(thread_group_z, kMaxGroups);
+	}
 	// The argument producer can still be queued. Snapshot, convert and clamp on
 	// the GPU before binding the consumer's pipeline or resources.
 	id<MTLBuffer> indirect_args = nil;
@@ -7062,11 +7091,53 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 		else std::snprintf(fault_label, sizeof(fault_label), "cs hash=0x%016llx", (unsigned long long)cs_hash);
 		KytyFaultOpSet(fault_label);
 	}
+	id<MTLBuffer> device_lds = nil;
+	if (const uint32_t lds_dwords = compute_info.stage.program ? compute_info.stage.program->metal_device_lds_dwords : 0;
+	    lds_dwords != 0) {
+		std::array<uint32_t, 3> groups {thread_group_x, thread_group_y, thread_group_z};
+		if (indirect_args != nil) {
+			// Size the backing from the GPU-produced, normalized dispatch arguments.
+			MetalContext::Instance().CommitCommandBuffer(true);
+			std::memcpy(groups.data(), indirect_args.contents, sizeof(groups));
+		}
+		if (std::find(groups.begin(), groups.end(), 0u) != groups.end()) {
+			CountDispatchStat(5);
+			return;
+		}
+		const auto device = MetalContext::Instance().GetDevice();
+		const uint64_t limit = std::min<uint64_t>(device.maxBufferLength, 64u << 20u);
+		uint64_t bytes = uint64_t(lds_dwords) * sizeof(uint32_t);
+		for (uint32_t dim: groups) {
+			if (bytes > limit / dim) {
+				std::fprintf(stderr, "[MetalLDS] cs=%016llx skipped: %u bytes/group, %ux%ux%u groups exceed backing budget %llu\n",
+				             (unsigned long long)cs_hash, lds_dwords * 4u, groups[0], groups[1], groups[2],
+				             (unsigned long long)limit);
+				CountDispatchStat(4);
+				return;
+			}
+			bytes *= dim;
+		}
+		device_lds = KytyNewBuffer(device, bytes, MTLResourceStorageModePrivate, __LINE__);
+		if (device_lds == nil) {
+			std::fprintf(stderr, "[MetalLDS] cs=%016llx failed to allocate %llu bytes\n",
+			             (unsigned long long)cs_hash, (unsigned long long)bytes);
+			CountDispatchStat(4);
+			return;
+		}
+		static std::unordered_set<uint64_t> reported;
+		if (reported.insert(cs_hash).second) {
+			std::fprintf(stderr, "[MetalLDS] cs=%016llx device backing: %u bytes/group, hardware limit %lu\n",
+			             (unsigned long long)cs_hash, lds_dwords * 4u, (unsigned long)device.maxThreadgroupMemoryLength);
+		}
+	}
 	const bool compute_pass_ok = MetalDrawExecutor::Instance().BeginComputePass();
 	if (!compute_pass_ok) CountDispatchStat(4);
 	if (compute_pass_ok) {
 		if (pstate) {
 			MetalDrawExecutor::Instance().SetComputePipeline(pstate);
+		}
+		if (device_lds != nil) {
+			MetalDrawExecutor::Instance().SetComputeBuffer(device_lds, 0, ShaderRecompiler::Msl::DeviceLdsBufferIndex);
 		}
 		if (id<MTLComputeCommandEncoder> cenc = MetalContext::Instance().GetActiveComputeEncoder()) {
 			for (id<MTLResource> r: cs_residency) {
@@ -8014,32 +8085,7 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 			             (unsigned long long)arg_ptrs[49], (unsigned long long)arg_ptrs[104]);
 		}
 
-		uint32_t tg_w = compute_info.threads_num[0] > 0 ? compute_info.threads_num[0] : 64;
-		uint32_t tg_h = compute_info.threads_num[1] > 0 ? compute_info.threads_num[1] : 1;
-		uint32_t tg_d = compute_info.threads_num[2] > 0 ? compute_info.threads_num[2] : 1;
-		// COMPUTE_DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS: the dispatch dimensions are thread counts, not group counts
-		// (the game's memory fill/copy kernels dispatch one thread per dword). The hardware launches ceil(threads / group size)
-		// groups; taking the counts as groups would run group-size times too many threads per dimension.
-		static const bool s_raw_groups = KYTY_ENV("KYTY_CS_RAW_GROUPS") != nullptr;  // old behaviour, for A/B runs
-		if (indirect_args_addr == 0 && (mode & (1u << 5u)) != 0 && !s_raw_groups  /* COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS */) {
-			thread_group_x = thread_group_x / tg_w + (thread_group_x % tg_w != 0);
-			thread_group_y = thread_group_y / tg_h + (thread_group_y % tg_h != 0);
-			thread_group_z = thread_group_z / tg_d + (thread_group_z % tg_d != 0);
-		}
-		// Guard: clamp group counts to a sane maximum (log when it happens).
-	// KYTY_MAX_GROUPS=<n>: cap on a dispatch's group count per dimension (default 0xFFFFFF).
-	static const uint32_t kMaxGroups = [] {
-		const char* e = KYTY_ENV("KYTY_MAX_GROUPS");
-		return e != nullptr ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0x00FFFFFFu;
-	}();
-	if (thread_group_x > kMaxGroups || thread_group_y > kMaxGroups || thread_group_z > kMaxGroups) {
-		std::fprintf(stderr, "[CsClamp] groups %u,%u,%u clamped to %u\n", thread_group_x, thread_group_y,
-		             thread_group_z, kMaxGroups);
-		thread_group_x = std::min(thread_group_x, kMaxGroups);
-		thread_group_y = std::min(thread_group_y, kMaxGroups);
-		thread_group_z = std::min(thread_group_z, kMaxGroups);
-	}
-		// KYTY_CS_PROBE debug: bind a zeroed counter at buffer 26 and report how many threads ran.
+	// KYTY_CS_PROBE debug: bind a zeroed counter at buffer 26 and report how many threads ran.
 		const bool cs_probe_here = KYTY_ENV("KYTY_CS_PROBE") != nullptr && compute_info.stage.program != nullptr &&
 		                           KYTY_ENV("KYTY_PROBE_HASH") != nullptr &&
 		                           std::strtoull(KYTY_ENV("KYTY_PROBE_HASH"), nullptr, 0) ==

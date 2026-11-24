@@ -528,6 +528,7 @@ struct CompiledShaderInfo {
 	// renderer must then fill the flat MSL argument-buffer layout instead of the
 	// historical SPIRV-Cross layout.
 	bool                          native_msl          = false;
+	uint32_t                      metal_device_lds_dwords = 0;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 };

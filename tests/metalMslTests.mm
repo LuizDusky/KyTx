@@ -24,6 +24,7 @@ static void Check(bool value, const char* message) {
 struct Fixture {
 	IR::Program program;
 	uint32_t lds_dwords = 0;
+	uint32_t metal_lds_limit_dwords = 0;
 	Fixture(uint32_t buffers = 1) {
 		program.stage = ShaderType::Compute;
 		program.wave_size = 32;
@@ -60,6 +61,7 @@ static id<MTLDevice> device;
 static id<MTLFunction> Compile(Fixture& fixture, const ShaderPixelInputInfo* pixel_options = nullptr) {
 	ShaderComputeInputInfo compute {};
 	compute.lds_size_dwords = fixture.lds_dwords;
+	compute.metal_threadgroup_limit_dwords = fixture.metal_lds_limit_dwords;
 	ShaderPixelInputInfo pixel {};
 	pixel.dual_source_blending = true;
 	ShaderStageInputInfo input {};
@@ -384,6 +386,70 @@ static void LargeLdsEmission() {
 	      "MSL silently shortened guest LDS");
 	std::printf("Large LDS emission: 36000 guest bytes retained (device limit %lu)\n",
 	            static_cast<unsigned long>(device.maxThreadgroupMemoryLength));
+}
+
+static void DeviceBackedLds() {
+	Fixture f;
+	f.metal_lds_limit_dwords = static_cast<uint32_t>(device.maxThreadgroupMemoryLength / sizeof(uint32_t));
+	f.lds_dwords = f.metal_lds_limit_dwords + 1u;
+	const auto input = [&](IR::StageInputKind kind, uint32_t component) {
+		return f.Emit(0, ValueOpcode::GetBuiltin, {Value(uint32_t(kind)), Value(component)});
+	};
+	const auto group_x = input(IR::StageInputKind::WorkgroupId, 0);
+	const auto group_y = input(IR::StageInputKind::WorkgroupId, 1);
+	const auto group_z = input(IR::StageInputKind::WorkgroupId, 2);
+	const auto y = f.Emit(0, ValueOpcode::IMul32, {group_y, Value(2u)});
+	const auto z = f.Emit(0, ValueOpcode::IMul32, {group_z, Value(4u)});
+	const auto yz = f.Emit(0, ValueOpcode::IAdd32, {y, z});
+	const auto index = f.Emit(0, ValueOpcode::IAdd32, {group_x, yz});
+	const auto value = f.Emit(0, ValueOpcode::IAdd32, {index, Value(100u)});
+	const auto tid = input(IR::StageInputKind::LocalInvocationIndex, 0);
+	const auto writer = f.Emit(0, ValueOpcode::IEqual32, {tid, Value(0u)});
+	const auto reader = f.Emit(0, ValueOpcode::IEqual32, {tid, Value(63u)});
+	const auto word = Value((f.lds_dwords - 1u) * 4u);
+	const uint64_t lds = f.program.memory_info.size();
+	f.program.memory_info.push_back({.kind = IR::ResourceKind::Lds});
+	f.Emit(0, ValueOpcode::WriteSharedU32, {word, value, writer}, lds);
+	f.Emit(0, ValueOpcode::Barrier, {});
+	const auto read = f.Emit(0, ValueOpcode::LoadSharedU32, {word, reader}, lds);
+	const auto output_offset = f.Emit(0, ValueOpcode::IMul32, {index, Value(4u)});
+	const auto handle = f.Buffer(0);
+	f.Emit(0, ValueOpcode::StoreBufferU32,
+	       {handle, Value(0u), output_offset, Value(0u), read, reader}, f.Memory(0));
+
+	id<MTLFunction> fn = Compile(f);
+	NSError* error = nil;
+	id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:fn error:&error];
+	if (!pipeline) std::fprintf(stderr, "%s\n", error.localizedDescription.UTF8String);
+	Check(pipeline != nil, "device-backed LDS pipeline failed");
+	id<MTLBuffer> scratch = [device newBufferWithLength:8u * f.lds_dwords * sizeof(uint32_t)
+	                                           options:MTLResourceStorageModePrivate];
+	id<MTLBuffer> output = [device newBufferWithLength:32 options:MTLResourceStorageModeShared];
+	id<MTLArgumentEncoder> args = [fn newArgumentEncoderWithBufferIndex:0];
+	id<MTLBuffer> argbuf = [device newBufferWithLength:args.encodedLength options:MTLResourceStorageModeShared];
+	[args setArgumentBuffer:argbuf offset:0];
+	[args setBuffer:output offset:0 atIndex:0];
+	uint32_t push[32] {};
+	uint32_t sizes[64] {32};
+	id<MTLCommandQueue> queue = [device newCommandQueue];
+	id<MTLCommandBuffer> command = [queue commandBuffer];
+	id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+	[encoder setComputePipelineState:pipeline];
+	[encoder setBuffer:argbuf offset:0 atIndex:0];
+	[encoder setBytes:push length:sizeof(push) atIndex:1];
+	[encoder setBytes:sizes length:sizeof(sizes) atIndex:25];
+	[encoder setBuffer:scratch offset:0 atIndex:ShaderRecompiler::Msl::DeviceLdsBufferIndex];
+	[encoder useResource:output usage:MTLResourceUsageWrite];
+	[encoder dispatchThreadgroups:MTLSizeMake(2, 2, 2) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	[encoder endEncoding];
+	[command commit];
+	[command waitUntilCompleted];
+	Check(command.status == MTLCommandBufferStatusCompleted, "device-backed LDS command failed");
+	const auto* values = static_cast<const uint32_t*>(output.contents);
+	for (uint32_t i = 0; i < 8; ++i) {
+		Check(values[i] == 100u + i, "device-backed LDS barrier or group isolation failed");
+	}
+	std::puts("Device-backed LDS: final dword shared across SIMD groups in eight isolated workgroups");
 }
 
 static void SubwordLoads() {
@@ -878,7 +944,7 @@ int main() {
 	@autoreleasepool {
 		try {
 			device = MTLCreateSystemDefaultDevice(); Check(device != nil, "Metal device unavailable");
-			ImageSampling(); PixelInterpolation(); LocalAppendConsume(); FloatClasses(); PackFloat2x16Rtz(); Shifts64(); FormattedStores(); RawBufferBounds(); DeclaredLds(); LargeLdsEmission(); SubwordLoads(); GuestAddressLoads(); DualSourceOutput(); VertexReadFirstLane();
+			ImageSampling(); PixelInterpolation(); LocalAppendConsume(); FloatClasses(); PackFloat2x16Rtz(); Shifts64(); FormattedStores(); RawBufferBounds(); DeclaredLds(); LargeLdsEmission(); DeviceBackedLds(); SubwordLoads(); GuestAddressLoads(); DualSourceOutput(); VertexReadFirstLane();
 			IndirectRectList(); LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();
 			setenv("KYTY_MSL_DISPATCHER", "1", 1);
 			LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();

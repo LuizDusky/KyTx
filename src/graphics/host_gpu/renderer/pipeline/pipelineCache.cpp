@@ -935,6 +935,7 @@ struct PipelineCache::ProgramCache {
 						auto info = std::move(result.program).TakeCompiledInfo();
 						info.shader_hash = msl_hash;
 						info.native_msl  = true;
+						info.metal_device_lds_dwords = msl.device_lds_dwords;
 						return {
 						    .specialization = std::move(specialization),
 						    .program        = std::move(info),
@@ -970,6 +971,7 @@ struct PipelineCache::ProgramCache {
 						// variant hash, not the raw shader hash.
 						info.shader_hash = msl_hash;
 						info.native_msl  = true;
+						info.metal_device_lds_dwords = msl.device_lds_dwords;
 						return {
 						    .specialization = std::move(specialization),
 						    .program        = std::move(info),
@@ -1569,30 +1571,30 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	// Metal's native emitter can back an oversized LDS with a private buffer.
+	// Keep the guest declaration intact through resource and shader compilation.
+	bool native_metal = false;
 #if defined(__APPLE__)
-	const auto max_lds_dwords = Metal::UseNativeMetalBackend() ? 8192u :
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
-#else
-	const auto max_lds_dwords =
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
+	native_metal = Metal::UseNativeMetalBackend();
+	if (native_metal) input_info.metal_threadgroup_limit_dwords = Metal::NativeMetalThreadgroupLimitDwords();
 #endif
-	if (input_info.lds_size_dwords > max_lds_dwords) {
-		static std::atomic_bool warned = false;
-		if (!warned.exchange(true, std::memory_order_relaxed)) {
-			PipelineCacheLog("GPU warning: game compute shader requests {} bytes of LDS, but "
-			                 "the Vulkan device limit is {} bytes. Clamping LDS; rendering may "
-			                 "be incorrect.",
-			                 input_info.lds_size_dwords * 4u, max_lds_dwords * 4u);
-		}
-	}
-	input_info.lds_size_dwords = std::min(input_info.lds_size_dwords, max_lds_dwords);
-	// KYTY_CS_LDS_MIN=<dwords>: raise the LDS declaration of every compute shader (diagnosis).
+	// KYTY_CS_LDS_MIN=<dwords>: raise the LDS declaration (diagnosis).
 	static const uint32_t lds_min = [] {
 		const char* value = std::getenv("KYTY_CS_LDS_MIN");
 		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : 0u;
 	}();
-	if (lds_min != 0 && input_info.lds_size_dwords < lds_min) {
-		input_info.lds_size_dwords = std::min(lds_min, max_lds_dwords);
+	input_info.lds_size_dwords = std::max(input_info.lds_size_dwords, lds_min);
+	if (!native_metal) {
+		const auto max_lds_dwords = m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize / 4u;
+		if (input_info.lds_size_dwords > max_lds_dwords) {
+			static std::atomic_bool warned = false;
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				PipelineCacheLog("GPU warning: game compute shader requests {} bytes of LDS, but "
+				                 "the Vulkan device limit is {} bytes. Clamping LDS; rendering may "
+				                 "be incorrect.", input_info.lds_size_dwords * 4u, max_lds_dwords * 4u);
+			}
+			input_info.lds_size_dwords = max_lds_dwords;
+		}
 	}
 	uint32_t          push_data_cursor = 0;
 	auto program = m_program_cache->Get(params, input_info, push_data_cursor);

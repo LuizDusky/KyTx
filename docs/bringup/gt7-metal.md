@@ -70,6 +70,18 @@ and the referenced toolchain.
   cross-wave synchronization and workgroup isolation. An isolated source probe
   replaced the branch predicate with its statically known value. GT7 still
   stalled at the same dispatch. The original shader remains the default.
+- `KYTY_TRACE_CS_WORD=5b8c099adc368053,0,288` records the four dwords beginning
+  with this shader's loop bound and correlates them with command completion.
+  With `KYTY_TRACE_CS_WORD_GPU=1`, a Metal blit queued before the dispatch also
+  captures the live input. In a failing run the CPU saw `8` at bind time and
+  the GPU read `0x80000514` from the same address. Successful dispatches often
+  completed in about 0.5–0.8 ms with the bound at `8`. The failure occurred
+  with a six-face texture bound. The PM4 and declared compute-buffer write traces
+  did not identify the writer of the changed word.
+- `KYTY_SNAPSHOT_GT7_LIGHT_CONSTANTS=1` preserves the confirmed 368-byte
+  read-only input for this shader in private upload storage for the dispatch.
+  `KYTY_METAL_STRICT_CUBES=1` keeps a one-layer alias from replacing a sampled
+  cubemap. Scene validation for these changes is in progress.
 - The PS5 reference is a final frame. It identifies the matching shoreline and
   shows which map elements are missing. Comparing intermediate outputs against
   PS5 requires a capture of the same render target on that platform.

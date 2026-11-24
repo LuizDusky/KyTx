@@ -5,6 +5,7 @@
 #include "graphics/presentation/traceWindow.h"
 #include "graphics/host_gpu/metal/metalBuffer.h"
 #include "graphics/host_gpu/metal/metalIndirect.h"
+#include "graphics/host_gpu/metal/metalOrder.h"
 #include "graphics/host_gpu/metal/metalPresenter.h"
 #include "graphics/host_gpu/metal/metalSampler.h"
 #include "graphics/host_gpu/metal/metalTiling.h"
@@ -123,6 +124,15 @@ static MetalBufferAllocation SnapshotBytes(const MetalBufferAllocation& src, uin
 	}
 	auto dyn = MetalBufferManager::Instance().SnapshotReadOnly(src, bytes);
 	return dyn.IsValid() ? dyn : src;
+}
+
+static bool SnapshotGt7LightingConstants(uint64_t shader_hash, size_t slot, size_t size,
+                                         const ShaderRecompiler::IR::BufferResource& resource) {
+	static const bool enabled = KYTY_ENV("KYTY_SNAPSHOT_GT7_LIGHT_CONSTANTS") != nullptr;
+	// GT7's lighting pass receives 92 dwords of scalar constants in a recycled
+	// guest upload ring. A queued read of dword 72 can see the next upload's data.
+	return enabled && shader_hash == 0x5b8c099adc368053ull && slot == 0 && size == 92 * sizeof(uint32_t) &&
+	       resource.read && !resource.written && !resource.atomic;
 }
 
 // Sample the range-copy kernel's output in GPU order. CPU reads of the live matrix pool at
@@ -1022,6 +1032,11 @@ static id<MTLTexture> GpuWrittenArrayFor(const ShaderTextureResource& tex, uint3
 	return writer;
 }
 
+static bool StrictCubeBindings() {
+	static const bool enabled = KYTY_ENV("KYTY_METAL_STRICT_CUBES") != nullptr;
+	return enabled;
+}
+
 static id<MTLTexture> GraphicsImageFor(const ShaderTextureResource& tex, uint32_t w, uint32_t h, uint64_t addr) {
 	if (id<MTLTexture> array = GpuWrittenArrayFor(tex, w, h)) {
 		const NSUInteger count = uint32_t(tex.LastLevel()) + 1u - tex.BaseLevel();
@@ -1030,6 +1045,8 @@ static id<MTLTexture> GraphicsImageFor(const ShaderTextureResource& tex, uint32_
 		}
 		return array;
 	}
+	// A matching 2D view of the allocation can hold only one cubemap face.
+	if (StrictCubeBindings() && tex.Type() == Prospero::ImageType::kCube) return ComputeGuestImage(tex, w, h, addr);
 	// GPU-produced plain 2D images are read from the same guest-memory views the writers used (see GpuSurfaceFor). A depth surface or a mipped
 	// image the GPU wrote has no guest-memory form: the lookups below handle those.
 	if (UmaSurfacesEnabled() && tex.Type() == Prospero::ImageType::kColor2D && tex.BaseLevel() == 0 && tex.LastLevel() == 0) {
@@ -1917,6 +1934,62 @@ static bool PassTraceCsBuffers() {
 	    std::strtoul(KYTY_ENV("KYTY_PASS_TRACE_CSBUF_N"), nullptr, 0) : 16u;
 	static uint32_t seen = 0;
 	return on && PassTraceCsFilter() && seen++ < limit;
+}
+
+// KYTY_TRACE_CS_WORD=<hash>,<buffer slot>,<byte offset>. Compare the CPU-visible
+// bytes at bind time with a copy ordered on Metal's queue when GPU mode is set.
+struct ComputeWordTrace {
+	uint64_t id = 0, offset = 0;
+	unsigned slot = 0;
+};
+
+static ComputeWordTrace PrepareComputeWordTrace(uint64_t shader, const ShaderComputeInputInfo& info) {
+	struct Options { unsigned long long shader = 0, offset = 0; unsigned slot = 0; bool gpu = false; };
+	static const Options options = [] {
+		Options out;
+		if (const char* value = KYTY_ENV("KYTY_TRACE_CS_WORD")) {
+			if (std::sscanf(value, "%llx,%u,%llu", &out.shader, &out.slot, &out.offset) != 3 ||
+			    out.slot >= 64 || out.offset % 4 != 0) return Options {};
+			out.gpu = KYTY_ENV("KYTY_TRACE_CS_WORD_GPU") != nullptr;
+		}
+		return out;
+	}();
+	if (options.shader == 0 || shader != options.shader || !info.stage.resources ||
+	    options.slot >= info.stage.resources->buffers.size()) return {};
+	const auto& desc = info.stage.resources->buffers[options.slot];
+	const uint64_t address = (uint64_t(desc.dwords[1] & 0xffff) << 32) | desc.dwords[0];
+	const uint64_t size = VsharpBytes(desc.dwords);
+	if (address == 0 || options.offset > size || size - options.offset < 16) return {};
+	static uint64_t sequence = 0;
+	if (sequence >= 1024) return {};
+	const uint64_t sequence_id = ++sequence;
+	if (!options.gpu) return {sequence_id, options.offset, options.slot};
+	const auto source = MetalBufferManager::Instance().GetBufferForGuestRange(address, size);
+	if (!source.IsValid() || source.offset > source.buffer.length ||
+	    options.offset + 16 > source.buffer.length - source.offset) return {};
+	auto& context = MetalContext::Instance();
+	id<MTLBuffer> copy = KytyNewBuffer(context.GetDevice(), 16, MTLResourceStorageModeShared, __LINE__);
+	if (copy == nil) return {};
+	context.EndCurrentEncoder();
+	id<MTLCommandBuffer> command = context.GetCurrentCommandBuffer();
+	id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
+	if (encoder == nil) return {};
+	OrderBegin(encoder);
+	[encoder copyFromBuffer:source.buffer sourceOffset:source.offset + options.offset
+	              toBuffer:copy destinationOffset:0 size:16];
+	OrderEnd(encoder);
+	[encoder endEncoding];
+	const uint64_t gpu_address = source.gpu_addr;
+	[command addCompletedHandler:^(id<MTLCommandBuffer> done) {
+		if (done.status != MTLCommandBufferStatusCompleted) return;
+		uint32_t words[4];
+		std::memcpy(words, copy.contents, sizeof(words));
+		std::fprintf(stderr, "[CsWordGPU] id=%llu guest=%llx gpu=%llx words=%08x,%08x,%08x,%08x\n",
+		             (unsigned long long)sequence_id, (unsigned long long)(address + options.offset),
+		             (unsigned long long)gpu_address, words[0], words[1], words[2], words[3]);
+	}];
+	context.CommitCommandBuffer(false);
+	return {sequence_id, options.offset, options.slot};
 }
 
 // KYTY_PASS_TRACE_CS=<hash>[,<hash>...]: the first 16 dispatches of each listed kernel are traced the same way at any flip (a LUT
@@ -7077,25 +7150,27 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 		}
 	}
 	{
-		// KYTY_LOG_CS_WRITES=<lo>,<hi>: compute dispatches that write a buffer based inside [lo,hi) (who produces vertex streams etc.).
-		static uint64_t s_wlo = 0, s_whi = 0;
+		// KYTY_LOG_CS_WRITES=<lo>,<hi>[,<first flip>]: compute write descriptors that overlap the guest range.
+		static uint64_t s_wlo = 0, s_whi = 0, s_wfirst = 2000;
 		static std::once_flag s_w_once;
 		std::call_once(s_w_once, [] {
 			if (const char* v = KYTY_ENV("KYTY_LOG_CS_WRITES")) {
 				char* e = nullptr;
 				s_wlo = std::strtoull(v, &e, 0);
-				if (*e == ',') s_whi = std::strtoull(e + 1, nullptr, 0);
+				if (*e == ',') s_whi = std::strtoull(e + 1, &e, 0);
+				if (*e == ',') s_wfirst = std::strtoull(e + 1, nullptr, 0);
 			}
 		});
 		static std::atomic<uint32_t> s_w_n {0};
 		const uint64_t wf = Libs::Graphics::TraceWindow::g_flip.load(std::memory_order_relaxed);
-		if (s_whi > s_wlo && wf >= 2000 && compute_info.stage.program && compute_info.stage.resources && s_w_n.load() < 3000) {
+		if (s_whi > s_wlo && wf >= s_wfirst && compute_info.stage.program && compute_info.stage.resources && s_w_n.load() < 3000) {
 			const auto& wp = *compute_info.stage.program;
 			const auto& wr = *compute_info.stage.resources;
 			for (size_t bi = 0; bi < wp.info.buffers.size() && bi < wr.buffers.size(); ++bi) {
 				if (!wp.info.buffers[bi].written) continue;
 				const uint64_t base = (static_cast<uint64_t>(wr.buffers[bi].dwords[1] & 0xFFFF) << 32) | wr.buffers[bi].dwords[0];
-				if (base >= s_wlo && base < s_whi && s_w_n.fetch_add(1) < 3000) {
+				const uint64_t bytes = VsharpBytes(wr.buffers[bi].dwords);
+				if (base != 0 && bytes != 0 && base < s_whi && s_wlo < base + bytes && s_w_n.fetch_add(1) < 3000) {
 					for (size_t ob = 0; ob < wp.info.buffers.size() && ob < wr.buffers.size() && ob < 6 && s_w_n.load() < 40; ++ob) {
 						const uint64_t obase = (static_cast<uint64_t>(wr.buffers[ob].dwords[1] & 0xFFFF) << 32) | wr.buffers[ob].dwords[0];
 						std::fprintf(stderr, "[CsWrite]    in-b%zu base=0x%llx nrec=%u stride=%u size=%u read=%d written=%d\n", ob, static_cast<unsigned long long>(obase),
@@ -7286,9 +7361,13 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 				             (unsigned long long)indirect_args_addr, cover.c_str());
 		}
 	}
+	const auto word_trace = PrepareComputeWordTrace(cs_hash, compute_info);
 	{
 		char fault_label[128];
-		if (indirect_args_addr != 0)
+		if (word_trace.id != 0)
+			std::snprintf(fault_label, sizeof(fault_label), "cs hash=0x%016llx word_trace=%llu",
+			              (unsigned long long)cs_hash, (unsigned long long)word_trace.id);
+		else if (indirect_args_addr != 0)
 			std::snprintf(fault_label, sizeof(fault_label), "cs hash=0x%016llx indirect args=0x%llx",
 			              (unsigned long long)cs_hash, (unsigned long long)indirect_args_addr);
 		else std::snprintf(fault_label, sizeof(fault_label), "cs hash=0x%016llx", (unsigned long long)cs_hash);
@@ -7463,6 +7542,7 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 				}
 				auto alloc = MetalBufferManager::Instance().GetBufferForGuestRange(
 				    addr, size != 0 ? size : 4096);
+				bool lighting_snapshot = false;
 				if (alloc.gpu_addr != 0 && compute_info.stage.program && b < compute_info.stage.program->info.buffers.size() &&
 				    !compute_info.stage.program->info.buffers[b].written) {
 					// Narrow experiment: FC27's range-copy kernel reads b1 from a recycled 512-KiB CPU
@@ -7493,6 +7573,12 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					const bool skin_upload = (s_skin_snapshot && cs_hash == 0x0cf7218b746c22e4ull && b == 1) || s_staging_snapshot;
 					const uint64_t live_gpu = alloc.gpu_addr;
 					alloc = SnapshotBytes(alloc, addr, size != 0 ? size : 4096, skin_upload);
+					if (SnapshotGt7LightingConstants(cs_hash, b, size, compute_info.stage.program->info.buffers[b])) {
+						if (auto copy = MetalBufferManager::Instance().SnapshotReadOnly(alloc, size); copy.IsValid()) {
+							alloc = copy;
+							lighting_snapshot = true;
+						}
+					}
 					if (skin_upload) {
 						static uint64_t last_log_flip = UINT64_MAX;
 						const uint64_t flip = Libs::Graphics::TraceWindow::g_flip.load();
@@ -7512,6 +7598,20 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					// allocation actually covers from this offset, or an in-shader access faults on the GPU.
 					const size_t avail = static_cast<size_t>([alloc.buffer length]) - alloc.offset;
 					sizes[b] = static_cast<uint32_t>(std::min<size_t>(sizes[b], avail));
+				}
+				if (word_trace.id != 0 && b == word_trace.slot) {
+					uint32_t words[4] {};
+					bool ok = true;
+					if (lighting_snapshot) {
+						std::memcpy(words, static_cast<const uint8_t*>(alloc.cpu_addr) + word_trace.offset, sizeof(words));
+					} else {
+						ok = Libs::LibKernel::Memory::TryReadBacking(addr + word_trace.offset, words, sizeof(words));
+					}
+					std::fprintf(stderr, "[CsWordBind] id=%llu flip=%llu guest=%llx gpu=%llx size=%u cpu_ok=%d snapshot=%d words=%08x,%08x,%08x,%08x\n",
+					             (unsigned long long)word_trace.id,
+					             (unsigned long long)Libs::Graphics::TraceWindow::g_flip.load(),
+					             (unsigned long long)(addr + word_trace.offset), (unsigned long long)alloc.gpu_addr,
+					             sizes[b], ok, lighting_snapshot, words[0], words[1], words[2], words[3]);
 				}
 				if (KYTY_ENV("KYTY_MTL_FAULT_INFO") != nullptr && alloc.gpu_addr == 0) {
 					std::fprintf(stderr, "[CsZeroPtr] hash=0x%016llx b=%zu addr=0x%llx size=%zu buffer=%p\n",
@@ -7623,6 +7723,13 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					} else if (!storage && (declared_array || cube)) {
 						texture = GpuWrittenArrayFor(tex, w, h);
 						if (texture != nil) via = "array-writer";
+					}
+					if (texture == nil && StrictCubeBindings() && cprog.native_msl && cube && !storage &&
+					    tex.Type() == Prospero::ImageType::kCube) {
+						texture = ComputeGuestImageFor(cprog, res, tex, w, h, addr);
+						if (texture == nil) texture = NullImageFor(cprog.info.images[res], false);
+						if (texture == nil) continue;
+						via = "cube-layout";
 					}
 					{
 						// GPU-produced images are views over the guest memory (see GpuSurfaceFor): writes and later reads meet in the same bytes.
@@ -8012,6 +8119,12 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					    : ShaderRecompiler::IR::NativeBinding(cprog.stage, binding.kind) + static_cast<uint32_t>(r);
 					texture = ConformToDeclaredArray(texture, declared_array);
 					id<MTLTexture> bound_tex = (!storage && (!mip_view_bound || array_texture)) ? ApplyDstSel(texture, tex) : texture;
+					if (word_trace.id != 0) {
+						std::fprintf(stderr, "[CsWordImage] id=%llu res=%u guest=%llx guest_type=%u depth=%u cube=%d array=%d via=%s metal_type=%lu layers=%lu\n",
+						             (unsigned long long)word_trace.id, res, (unsigned long long)addr, (unsigned)tex.Type(),
+						             (unsigned)tex.Depth(), cube, declared_array, via, (unsigned long)bound_tex.textureType,
+						             (unsigned long)bound_tex.arrayLength);
+					}
 					if (slot < 256) {
 						arg_ptrs[slot] = [bound_tex gpuResourceID]._impl;
 					}
@@ -8227,23 +8340,23 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					// Buffers: bind by argument index (the buffer index used by the shader's [[id(N)]]).
 					const auto& bsnap = *compute_info.stage.resources;
 					for (size_t b = 0; b < bsnap.buffers.size() && b < 64; ++b) {
-						const auto& desc = bsnap.buffers[b];
-						const uint64_t baddr = (static_cast<uint64_t>(desc.dwords[1] & 0xFFFF) << 32) | desc.dwords[0];
-						if (baddr == 0) continue;
-						const size_t bsize = sizes[b] != 0 ? sizes[b] : 4096;
-						auto balloc = MetalBufferManager::Instance().GetBufferForGuestRange(baddr, bsize);
+						const auto& balloc = cs_buffers[b];
+						if (!balloc.IsValid()) continue;
+						const size_t bsize = std::min<size_t>(sizes[b] != 0 ? sizes[b] : 4096, balloc.size);
 						if (balloc.gpu_addr != 0 && balloc.buffer != nil) {
 							[ae setBuffer:balloc.buffer offset:balloc.offset atIndex:static_cast<NSUInteger>(cs_buf_base + b)];
 							if (id<MTLComputeCommandEncoder> uenc = MetalContext::Instance().GetActiveComputeEncoder()) {
 								[uenc useResource:balloc.buffer usage:(MTLResourceUsageRead | MTLResourceUsageWrite)];
 							}
 						}
-						if (KYTY_ENV("KYTY_CS_PROBE") != nullptr && KYTY_ENV("KYTY_PROBE_HASH") != nullptr &&
+						if (balloc.buffer.contents != nullptr && KYTY_ENV("KYTY_CS_PROBE") != nullptr && KYTY_ENV("KYTY_PROBE_HASH") != nullptr &&
 						    std::strtoull(KYTY_ENV("KYTY_PROBE_HASH"), nullptr, 0) == compute_info.stage.program->shader_hash) {
 							const uint32_t* w = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>([balloc.buffer contents]) + balloc.offset);
 							size_t nz = 0;
 							const size_t n = bsize / 4;
 							for (size_t i = 0; i < n; ++i) nz += w[i] != 0;
+							const auto& desc = bsnap.buffers[b];
+							const uint64_t baddr = (uint64_t(desc.dwords[1] & 0xffff) << 32) | desc.dwords[0];
 							std::fprintf(stderr, "[CsIn] buf%zu guest=0x%llx size=%zu nonzero_dwords=%zu/%zu first:", b,
 							             (unsigned long long)baddr, bsize, nz, n);
 							for (size_t i = 0; i < 8 && i < n; ++i) std::fprintf(stderr, " %08x", w[i]);
@@ -8451,6 +8564,15 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 		d[1] = 0u;
 		MetalDrawExecutor::Instance().SetComputeBuffer(s_nan_dbg, 0, 28);
 		nan_dbg = s_nan_dbg;
+	}
+	if (word_trace.id != 0 && compute_pass_ok) {
+		const uint64_t sequence = word_trace.id;
+		id<MTLCommandBuffer> dispatch_command = MetalContext::Instance().GetCurrentCommandBuffer();
+		[dispatch_command addCompletedHandler:^(id<MTLCommandBuffer> done) {
+			std::fprintf(stderr, "[CsWordDone] id=%llu status=%lu gpu_ms=%.2f\n",
+			             (unsigned long long)sequence, (unsigned long)done.status,
+			             1000.0 * (done.GPUEndTime - done.GPUStartTime));
+		}];
 	}
 	if (indirect_args) {
 		MetalDrawExecutor::Instance().DispatchIndirect(indirect_args, 0, host_w, host_h, host_d);

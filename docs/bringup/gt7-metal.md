@@ -67,8 +67,9 @@ and the referenced toolchain.
   threads serving a 1024-thread guest group with 64 KiB of device-backed LDS.
   The generated shader includes a threadgroup barrier inside a wave-vote branch.
   A separate M4 test with the same group dimensions and LDS size passes
-  cross-wave synchronization and workgroup isolation.
-  The failure mechanism within that dispatch still needs verification.
+  cross-wave synchronization and workgroup isolation. An isolated source probe
+  replaced the branch predicate with its statically known value. GT7 still
+  stalled at the same dispatch. The original shader remains the default.
 - The PS5 reference is a final frame. It identifies the matching shoreline and
   shows which map elements are missing. Comparing intermediate outputs against
   PS5 requires a capture of the same render target on that platform.

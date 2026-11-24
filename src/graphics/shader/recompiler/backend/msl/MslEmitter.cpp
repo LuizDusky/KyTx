@@ -883,7 +883,9 @@ struct Emitter {
 	[[nodiscard]] uint32_t LdsDwords() const {
 		if (program.stage != ShaderType::Compute) return 2048u;
 		const uint32_t declared = input_info.compute ? input_info.compute->lds_size_dwords : 0u;
-		return declared != 0 ? std::min(declared, 8192u) : 8192u;
+		// Preserve the guest bounds. Metal validates the complete pipeline's
+		// threadgroup allocation against the selected device.
+		return declared != 0 ? declared : 8192u;
 	}
 
 	[[nodiscard]] bool UsesLds() const {

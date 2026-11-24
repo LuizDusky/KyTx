@@ -640,6 +640,10 @@ id<MTLComputePipelineState> MetalPipelineManager::GetOrCreateComputePipeline(
 		desc.label = [NSString stringWithFormat:@"CS %016llx", (unsigned long long)cs_hash];
 		id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithDescriptor:desc options:MTLPipelineOptionNone reflection:nil error:&error];
 		if (!pipeline) {
+			std::fprintf(stderr, "[MetalPipeline] compute creation failed cs=0x%016llx threadgroup_limit=%lu: %s\n",
+			             static_cast<unsigned long long>(cs_hash),
+			             static_cast<unsigned long>(device.maxThreadgroupMemoryLength),
+			             error ? [[error localizedDescription] UTF8String] : "Unknown error");
 			LOGF_COLOR(Log::Color::BrightRed, "Metal: Failed to create compute pipeline state: %s\n",
 			           error ? [[error localizedDescription] UTF8String] : "Unknown error");
 			return nil;

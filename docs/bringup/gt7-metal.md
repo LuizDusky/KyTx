@@ -54,13 +54,21 @@ and the referenced toolchain.
   at `0x9296cd0000`, but the old storage allocation was a single 2D texture.
   Several World Map pixel shaders sampled a six-face cube decoded from guest
   backing at the same address. That copy had zero nonzero bytes. The experimental
-  `KYTY_METAL_GPU_ARRAYS=1` path retains all six layers and the mip chain
-  for the writer and reuses the texture for compatible array and cube readers.
-  Set `KYTY_GPU_ARRAY_ADDRESS=9296cd0000` with the flag to isolate this image.
+  GPU array path retains all six layers and the mip chain for the writer and
+  reuses the texture for compatible array and cube readers. It is enabled by
+  default for `PPSA01317`, `APP_VER=01.710.000`. `KYTY_METAL_GPU_ARRAYS=0`
+  disables it for comparison, `=1` enables it for other titles, and
+  `KYTY_GPU_ARRAY_ADDRESS=9296cd0000` isolates this image.
   The two compute writers at `ed3ba044f1410a06` and `4269bcac84fccc8c` share
   the same six-layer allocation in the GT7 trace.
   An M4 test writes the sixth layer through a view of mip level 1 and verifies
-  the stored channels. This path still needs a completed World Map run.
+  the stored channels. In the World Map run, 92 sampled bindings of
+  `0x9296cd0000` reused the six-face GPU texture. Trees, roads and terrain became
+  visible. A fixed 4K terrain region went from 7,548 of 7,548 sampled pixels
+  with all channels ≤3 to 1,490 of 7,548. The sample covers 4–27% of image width
+  and 39–64% of image height at an eight-pixel stride. The game reached the map
+  with the default title profile as well. The scene still lacks the reference
+  brightness and menu text.
 - Follow-up runs intermittently stalled in Metal before reaching the cubemap
   writer. With `KYTY_MTL_SPLIT_OPS=1` and `KYTY_MTL_GPU_TIME=1`, two runs isolated
   the stalled command buffer to `5b8c099adc368053`, one group of 512 Metal
@@ -83,8 +91,9 @@ and the referenced toolchain.
   six-face texture or the guest cube layout if the newest writer has one layer.
   In a World Map run with both changes enabled the traced shader completed
   364 dispatches, with the bound preserved at `8` and six-face views bound.
-  The scene remains mostly black. Set `KYTY_SNAPSHOT_GT7_LIGHT_CONSTANTS=0`
-  or `KYTY_METAL_STRICT_CUBES=0` to isolate the changes in a diagnostic run.
+  That run still used the guest-backed cubemaps. Set
+  `KYTY_SNAPSHOT_GT7_LIGHT_CONSTANTS=0` or `KYTY_METAL_STRICT_CUBES=0` to isolate
+  the changes in a diagnostic run.
 - The PS5 reference is a final frame. It identifies the matching shoreline and
   shows which map elements are missing. Comparing intermediate outputs against
   PS5 requires a capture of the same render target on that platform.
@@ -123,3 +132,7 @@ completed command buffers above the trace threshold of 20 ms reached 65.8 ms
 in this interval. This measurement covers a command buffer, which may contain
 several passes and need not align with one frame. Set `KYTY_GPU_BUSY=1` to
 measure the proportion of wall time occupied by completed Metal work.
+Reporting a 120 Hz virtual VBlank kept the 3840×2160 allocations in the tested
+World Map. The 120 Hz run measured a median of 8.5 fps in seven steady samples.
+The default 60 Hz title profile also measured a median of 8.5 fps across 17
+steady samples. Both runs rendered internally at 3840×2160.

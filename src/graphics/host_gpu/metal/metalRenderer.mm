@@ -19,6 +19,7 @@
 #include "graphics/shader/recompiler/backend/msl/MslEmitter.h"
 #include "common/logging/log.h"
 #include "kernel/memory.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <bit>
@@ -670,7 +671,12 @@ static std::mutex s_cs_storage_mutex;
 static std::unordered_map<uint64_t, CsStorageEntry> s_cs_storage;
 static uint64_t s_cs_storage_serial = 0;
 static bool GpuWritableArraysEnabled() {
-	static const bool enabled = KYTY_ENV("KYTY_METAL_GPU_ARRAYS") != nullptr;
+	static const bool enabled = [] {
+		if (const char* value = KYTY_ENV("KYTY_METAL_GPU_ARRAYS")) return std::strcmp(value, "0") != 0;
+		std::string title_id, version;
+		return Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && title_id == "PPSA01317" &&
+		       Loader::SystemContentParamSfoGetString("APP_VER", &version) && version == "01.710.000";
+	}();
 	return enabled;
 }
 static bool AllocateGpuWritableArray(uint64_t guest_address) {

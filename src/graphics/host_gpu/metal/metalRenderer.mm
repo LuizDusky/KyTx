@@ -660,6 +660,13 @@ static bool GpuWritableArraysEnabled() {
 	static const bool enabled = KYTY_ENV("KYTY_METAL_GPU_ARRAYS") != nullptr;
 	return enabled;
 }
+static bool AllocateGpuWritableArray(uint64_t guest_address) {
+	static const uint64_t filter = [] {
+		const char* value = KYTY_ENV("KYTY_GPU_ARRAY_ADDRESS");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : uint64_t{0};
+	}();
+	return GpuWritableArraysEnabled() && (filter == 0 || filter == guest_address);
+}
 // Last GPU writer of a guest address (compute storage image or render target): the surface converter uses it as the source of
 // truth when a later pass reads the same memory with another format, size or tile layout.
 static void TraceRangeOp(const char* op, uint64_t addr, uint64_t bytes);
@@ -5435,11 +5442,12 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 						    std::strtoull(KYTY_ENV("KYTY_DUMP_RT_MIN_FLIP"), nullptr, 10) : 0;
 						if (flip >= first && flip - first < 4) {
 							const auto swizzle = texture.swizzle;
-							std::fprintf(stderr, "[BoundPS] hash=%016llx slot=%zu addr=%llx fmt=%u tile=%u target=%lu mtl=%lu dim=%lux%lux%lu guest=%03x host=%u,%u,%u,%u\n",
+							std::fprintf(stderr, "[BoundPS] hash=%016llx slot=%zu addr=%llx fmt=%u tile=%u target=%lu mtl=%lu dim=%lux%lux%lu layers=%lu writer=%d guest=%03x host=%u,%u,%u,%u\n",
 							             (unsigned long long)stage.program->shader_hash, i, (unsigned long long)addr,
 							             (unsigned)tex.Format(), (unsigned)tex.TileMode(), (unsigned long)texture.textureType,
 							             (unsigned long)texture.pixelFormat, (unsigned long)texture.width, (unsigned long)texture.height,
-							             (unsigned long)texture.depth, tex.DstSelXYZW(), (unsigned)swizzle.red, (unsigned)swizzle.green,
+							             (unsigned long)texture.depth, (unsigned long)texture.arrayLength,
+							             base_image == GpuWrittenArrayFor(tex, w, h), tex.DstSelXYZW(), (unsigned)swizzle.red, (unsigned)swizzle.green,
 							             (unsigned)swizzle.blue, (unsigned)swizzle.alpha);
 						}
 					}
@@ -7601,8 +7609,8 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					    cprog.info.images[res].dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
 					const bool cube = res < cprog.info.images.size() && cprog.info.images[res].cube;
 					const bool gpu_arrays = GpuWritableArraysEnabled();
-					if (gpu_arrays && declared_array && storage && tex.Type() == Prospero::ImageType::kColor2DArray &&
-					    tex.BaseArray5() == 0 && tex.BaseLevel() <= tex.LastLevel()) {
+					if (declared_array && storage && tex.Type() == Prospero::ImageType::kColor2DArray &&
+					    tex.BaseArray5() == 0 && tex.BaseLevel() <= tex.LastLevel() && AllocateGpuWritableArray(addr)) {
 						const auto fmt = MetalFormatFromBufferFormat(tex.Format());
 						const uint32_t layers = uint32_t(tex.Depth()) + 1u;
 						const uint32_t levels = std::max(tex.LastLevel(), tex.MaxMip()) + 1u;

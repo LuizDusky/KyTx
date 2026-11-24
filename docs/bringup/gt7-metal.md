@@ -56,14 +56,17 @@ and the referenced toolchain.
   backing at the same address. That copy had zero nonzero bytes. The experimental
   `KYTY_METAL_GPU_ARRAYS=1` path retains all six layers and the mip chain
   for the writer and reuses the texture for compatible array and cube readers.
+  Set `KYTY_GPU_ARRAY_ADDRESS=9296cd0000` with the flag to isolate this image.
+  The two compute writers at `ed3ba044f1410a06` and `4269bcac84fccc8c` share
+  the same six-layer allocation in the GT7 trace.
   An M4 test writes the sixth layer through a view of mip level 1 and verifies
   the stored channels. This path still needs a completed World Map run.
 - Follow-up runs intermittently stalled in Metal before reaching the cubemap
-  writer. The watchdog snapshot repeatedly showed the last prepared indirect
-  dispatch as `e9a66de293bc4b3d` with a `(0,1,1)` grid. An independent Metal
-  check ran 16 command buffers with the same empty grid followed by a two-group
-  dispatch. Each completed with the expected 128 threads across the two dispatches.
-  The stalled command-buffer operation remains unidentified.
+  writer. With `KYTY_MTL_SPLIT_OPS=1` and `KYTY_MTL_GPU_TIME=1`, two runs isolated
+  the stalled command buffer to `5b8c099adc368053`, one group of 512 Metal
+  threads serving a 1024-thread guest group with 64 KiB of device-backed LDS.
+  The generated shader includes a threadgroup barrier inside a wave-vote branch.
+  The failure mechanism within that dispatch still needs verification.
 - The PS5 reference is a final frame. It identifies the matching shoreline and
   shows which map elements are missing. Comparing intermediate outputs against
   PS5 requires a capture of the same render target on that platform.
@@ -92,3 +95,13 @@ image address and `KYTY_DUMP_RT_MIN_FLIP` to the start of the 12-frame window.
 draw and before the next draw to that target. Set `KYTY_DUMP_RT_DIR` to the
 existing scratch directory for the capture. The draw trace reports the color
 attachment index alongside its shader hash and write masks.
+
+## M4 frame timing
+
+Two World Map runs between guest flips 1525 and 1850 measured a median of 8 fps
+(7.5 to 8.5 fps across 35 samples). The game still uses 3840×2160 targets in the
+scene when Video Out advertises 1080p. In the run with `KYTY_MTL_GPU_TIME=1`,
+completed command buffers above the trace threshold of 20 ms reached 65.8 ms
+in this interval. This measurement covers a command buffer, which may contain
+several passes and need not align with one frame. Set `KYTY_GPU_BUSY=1` to
+measure the proportion of wall time occupied by completed Metal work.

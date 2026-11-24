@@ -33,6 +33,19 @@ FEXCore revision, dependencies and game launch command. The
 [GT7 bring-up notes](docs/bringup/gt7-metal.md) list the descriptor and shader
 regression tests and explain how to reproduce the Metal captures.
 
+## Open games
+
+Build the native launcher with `bash tools/build_prospero_launcher.sh /path/to/build/kytx`.
+Open `Prospero.app` beside `kyty_emulator`, then add a game directory, .pkg, or
+.fpkg to the library. You can also use Finder's **Open With** menu for package files.
+
+For supported PS5 packages, Prospero streams the original file using a compatible
+`read-fpkg` helper. The launcher looks beside the emulator and in
+`../fpkg-reader/read-fpkg` relative to the emulator directory. Use **Settings →
+Package reader** to select a helper elsewhere. The helper and its dependencies
+are separate from the launcher. A game-specific JSON patch can be selected in
+**Game Options**.
+
 ## Development notes
 
 Diagnostic switches are environment variables documented next to their code (for example `KYTY_PASS_TRACE_*`,

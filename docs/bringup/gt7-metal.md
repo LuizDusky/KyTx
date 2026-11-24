@@ -56,7 +56,14 @@ and the referenced toolchain.
   backing at the same address. That copy had zero nonzero bytes. The experimental
   `KYTY_METAL_GPU_ARRAYS=1` path retains all six layers and the mip chain
   for the writer and reuses the texture for compatible array and cube readers.
-  This path still needs a completed World Map run.
+  An M4 test writes the sixth layer through a view of mip level 1 and verifies
+  the stored channels. This path still needs a completed World Map run.
+- Follow-up runs intermittently stalled in Metal before reaching the cubemap
+  writer. The watchdog snapshot repeatedly showed the last prepared indirect
+  dispatch as `e9a66de293bc4b3d` with a `(0,1,1)` grid. An independent Metal
+  check ran 16 command buffers with the same empty grid followed by a two-group
+  dispatch. Each completed with the expected 128 threads across the two dispatches.
+  The stalled command-buffer operation remains unidentified.
 - The PS5 reference is a final frame. It identifies the matching shoreline and
   shows which map elements are missing. Comparing intermediate outputs against
   PS5 requires a capture of the same render target on that platform.

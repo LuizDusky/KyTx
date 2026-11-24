@@ -349,6 +349,74 @@ static void RawBufferBounds() {
 	}
 }
 
+static void StorageImageChannelMapping() {
+	constexpr uint32_t reverse = 7u | (6u << 3u) | (5u << 6u) | (4u << 9u);
+	const uint32_t texture_formats[] = {32, 32, 16};
+	for (size_t check = 0; check < std::size(texture_formats); ++check) {
+		const bool sparse = check != 0;
+		const bool packed_16 = texture_formats[check] == 16;
+		Fixture f(0);
+		IR::ImageResource image {};
+		image.resource_class = IR::ImageResourceClass::Storage;
+		image.numeric_class = Prospero::TextureNumericClass::Float;
+		image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+		image.shader_swizzle = reverse;
+		image.written = true;
+		f.program.info.images.push_back(image);
+		f.program.bindings.descriptors.push_back({*IR::DescriptorBindingForImage(image), {0}});
+		const auto handle = f.Emit(0, ValueOpcode::GetImageResource,
+		    {Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u)});
+		const auto address = f.Emit(0, ValueOpcode::MakeImageAddress,
+		    {Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),
+		     Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u)});
+		IR::MemoryInfo memory {};
+		memory.kind = IR::ResourceKind::Image;
+		memory.dmask = sparse ? 0x5u : 0xfu;
+		memory.data_bits = texture_formats[check];
+		memory.data_dwords = packed_16 ? 1 : sparse ? 2 : 4;
+		memory.image_dimension = image.dimension;
+		memory.image_address_components = 3;
+		f.program.memory_info.push_back(memory);
+		const auto value = f.Emit(0, ValueOpcode::CompositeConstructU32x4, {
+		    Value(packed_16 ? 0x38003400u : std::bit_cast<uint32_t>(0.25f)),
+		    Value(std::bit_cast<uint32_t>(sparse ? 0.5f : 0.375f)),
+		    Value(std::bit_cast<uint32_t>(0.5f)),
+		    Value(std::bit_cast<uint32_t>(1.0f)),
+		});
+		f.Emit(0, ValueOpcode::ImageWrite, {handle, address, value, Value(true)});
+		id<MTLFunction> function = Compile(f);
+		NSError* error = nil;
+		id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+		Check(pipeline != nil, "storage image mapping pipeline failed");
+		MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+		    width:1 height:1 mipmapped:NO];
+		desc.textureType = MTLTextureType3D;
+		desc.storageMode = MTLStorageModeShared;
+		desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+		id<MTLTexture> texture = [device newTextureWithDescriptor:desc];
+		id<MTLArgumentEncoder> args = [function newArgumentEncoderWithBufferIndex:0];
+		id<MTLBuffer> argbuf = [device newBufferWithLength:args.encodedLength options:MTLResourceStorageModeShared];
+		[args setArgumentBuffer:argbuf offset:0];
+		[args setTexture:texture atIndex:64];
+		const uint32_t push[32] {}, sizes[64] {};
+		id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+		id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+		[encoder setComputePipelineState:pipeline]; [encoder setBuffer:argbuf offset:0 atIndex:0];
+		[encoder setBytes:push length:sizeof(push) atIndex:1]; [encoder setBytes:sizes length:sizeof(sizes) atIndex:25];
+		[encoder useResource:texture usage:MTLResourceUsageWrite];
+		[encoder dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+		[encoder endEncoding]; [command commit]; [command waitUntilCompleted];
+		Check(command.status == MTLCommandBufferStatusCompleted, "storage image mapping dispatch failed");
+		float result[4] {};
+		[texture getBytes:result bytesPerRow:16 bytesPerImage:16 fromRegion:MTLRegionMake3D(0,0,0,1,1,1)
+		    mipmapLevel:0 slice:0];
+		const float expected[] = {sparse ? 0.0f : 1.0f, 0.5f, sparse ? 0.0f : 0.375f, 0.25f};
+		Check(std::equal(std::begin(result), std::end(result), expected),
+		      "storage image ignored inverse DST_SEL or compacted DMASK");
+	}
+	std::puts("Storage image channel mapping: 3 GPU cases passed");
+}
+
 static void DeclaredLds() {
 	Fixture f;
 	f.lds_dwords = 384;
@@ -944,7 +1012,7 @@ int main() {
 	@autoreleasepool {
 		try {
 			device = MTLCreateSystemDefaultDevice(); Check(device != nil, "Metal device unavailable");
-			ImageSampling(); PixelInterpolation(); LocalAppendConsume(); FloatClasses(); PackFloat2x16Rtz(); Shifts64(); FormattedStores(); RawBufferBounds(); DeclaredLds(); LargeLdsEmission(); DeviceBackedLds(); SubwordLoads(); GuestAddressLoads(); DualSourceOutput(); VertexReadFirstLane();
+			ImageSampling(); StorageImageChannelMapping(); PixelInterpolation(); LocalAppendConsume(); FloatClasses(); PackFloat2x16Rtz(); Shifts64(); FormattedStores(); RawBufferBounds(); DeclaredLds(); LargeLdsEmission(); DeviceBackedLds(); SubwordLoads(); GuestAddressLoads(); DualSourceOutput(); VertexReadFirstLane();
 			IndirectRectList(); LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();
 			setenv("KYTY_MSL_DISPATCHER", "1", 1);
 			LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();

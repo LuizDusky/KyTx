@@ -670,13 +670,18 @@ struct Emitter {
 		return bits;
 	}
 
-	std::string TexelValue(const IR::ImageResource& image, const std::string& bits_in,
-	                       const IR::MemoryInfo* mem = nullptr) {
-		std::string bits = bits_in;
-		if (mem != nullptr && mem->data_bits == 16u) {
-			bits = "kyty_d16_unpack(" + bits_in + ", " + std::to_string(mem->dmask != 0u ? mem->dmask : 1u) + "u, " +
-			       (ImageIsFloatClass(image) ? "true" : "false") + ")";
+	std::string TexelValue(const IR::ImageResource& image, const std::string& logical,
+	                       uint32_t mask) {
+		// Metal writes the physical RGBA components. Reverse the descriptor's
+		// channel selection so a later sampled view sees the original logical values.
+		std::string bits = "uint4(";
+		for (uint32_t physical = 0; physical < 4u; ++physical) {
+			if (physical != 0) bits += ", ";
+			const uint32_t source = IR::ImageStoreSourceChannel(image.shader_swizzle, physical);
+			bits += source < 4u && ((mask >> source) & 1u) != 0 ?
+			    logical + "." + std::string(1, "xyzw"[source]) : "0u";
 		}
+		bits += ")";
 		switch (image.numeric_class) {
 			case Prospero::TextureNumericClass::Uint: return bits;
 			case Prospero::TextureNumericClass::Sint: return "as_type<int4>(" + bits + ")";
@@ -1668,8 +1673,24 @@ struct Emitter {
 				const std::string lod =
 				    image.mip_mode == IR::ImageMipMode::Dynamic
 				        ? AddressU32(*address, mem, static_cast<uint32_t>(dim.components)) : "0u";
-				const std::string value = TexelValue(image, Expr(inst.Arg(2)), &mem);
-				body << "\t\tif (" << Expr(inst.Arg(3)) << ") {\n\t\t\t" << tex << ".write(" << value
+				const uint32_t mask = mem.dmask != 0u ? mem.dmask : 1u;
+				const auto bits = Expr(inst.Arg(2));
+				body << "\t\tif (" << Expr(inst.Arg(3)) << ") {\n";
+				if (mem.data_bits == 16u) {
+					body << "\t\t\tconst uint4 kyty_store = kyty_d16_unpack(" << bits << ", " << mask << "u, "
+					     << (ImageIsFloatClass(image) ? "true" : "false") << ");\n";
+				} else {
+					std::array<std::string, 4> channels {"0u", "0u", "0u", "0u"};
+					uint32_t packed = 0;
+					for (uint32_t logical = 0; logical < 4u; ++logical) {
+						if ((mask & (1u << logical)) != 0) {
+							channels[logical] = "(" + bits + ")." + std::string(1, "xyzw"[packed++]);
+						}
+					}
+					body << "\t\t\tconst uint4 kyty_store = uint4(" << channels[0] << ", " << channels[1]
+					     << ", " << channels[2] << ", " << channels[3] << ");\n";
+				}
+				body << "\t\t\t" << tex << ".write(" << TexelValue(image, "kyty_store", mask)
 				     << ", " << coord << array_arg << ", " << lod << ");\n\t\t}\n";
 				return;
 			}

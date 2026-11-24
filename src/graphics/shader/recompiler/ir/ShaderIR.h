@@ -119,6 +119,14 @@ enum class ImageMipMode { None, Dynamic };
 
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
+// Storage writes carry enabled logical channels in ascending DMASK order.
+constexpr uint32_t ImageStoreSourceChannel(uint32_t swizzle, uint32_t physical) {
+	for (uint32_t logical = 0; logical < 4u; ++logical) {
+		if (((swizzle >> (logical * 3u)) & 7u) == 4u + physical) return logical;
+	}
+	return UINT32_MAX;
+}
+
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
 

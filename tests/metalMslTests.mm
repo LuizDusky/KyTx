@@ -58,8 +58,9 @@ struct Fixture {
 
 static id<MTLDevice> device;
 
-static id<MTLFunction> Compile(Fixture& fixture, const ShaderPixelInputInfo* pixel_options = nullptr) {
-	ShaderComputeInputInfo compute {};
+static id<MTLFunction> Compile(Fixture& fixture, const ShaderPixelInputInfo* pixel_options = nullptr,
+                               const ShaderComputeInputInfo* compute_options = nullptr) {
+	ShaderComputeInputInfo compute = compute_options != nullptr ? *compute_options : ShaderComputeInputInfo {};
 	compute.lds_size_dwords = fixture.lds_dwords;
 	compute.metal_threadgroup_limit_dwords = fixture.metal_lds_limit_dwords;
 	ShaderPixelInputInfo pixel {};
@@ -463,10 +464,17 @@ static void LargeLdsEmission() {
 	            static_cast<unsigned long>(device.maxThreadgroupMemoryLength));
 }
 
-static void DeviceBackedLds() {
+static void DeviceBackedLds(bool paired = false) {
 	Fixture f;
 	f.metal_lds_limit_dwords = static_cast<uint32_t>(device.maxThreadgroupMemoryLength / sizeof(uint32_t));
-	f.lds_dwords = f.metal_lds_limit_dwords + 1u;
+	f.lds_dwords = paired ? 16384u : f.metal_lds_limit_dwords + 1u;
+	f.program.wave_size = paired ? 64u : 32u;
+	ShaderComputeInputInfo workgroup {};
+	workgroup.host_subgroup_size = 32;
+	workgroup.threads_num[0] = paired ? 8 : 64;
+	workgroup.threads_num[1] = paired ? 8 : 1;
+	workgroup.threads_num[2] = paired ? 16 : 1;
+	const uint32_t guest_threads = paired ? 1024 : 64;
 	const auto input = [&](IR::StageInputKind kind, uint32_t component) {
 		return f.Emit(0, ValueOpcode::GetBuiltin, {Value(uint32_t(kind)), Value(component)});
 	};
@@ -480,7 +488,7 @@ static void DeviceBackedLds() {
 	const auto value = f.Emit(0, ValueOpcode::IAdd32, {index, Value(100u)});
 	const auto tid = input(IR::StageInputKind::LocalInvocationIndex, 0);
 	const auto writer = f.Emit(0, ValueOpcode::IEqual32, {tid, Value(0u)});
-	const auto reader = f.Emit(0, ValueOpcode::IEqual32, {tid, Value(63u)});
+	const auto reader = f.Emit(0, ValueOpcode::IEqual32, {tid, Value(guest_threads - 1u)});
 	const auto word = Value((f.lds_dwords - 1u) * 4u);
 	const uint64_t lds = f.program.memory_info.size();
 	f.program.memory_info.push_back({.kind = IR::ResourceKind::Lds});
@@ -492,7 +500,7 @@ static void DeviceBackedLds() {
 	f.Emit(0, ValueOpcode::StoreBufferU32,
 	       {handle, Value(0u), output_offset, Value(0u), read, reader}, f.Memory(0));
 
-	id<MTLFunction> fn = Compile(f);
+	id<MTLFunction> fn = Compile(f, nullptr, &workgroup);
 	NSError* error = nil;
 	id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:fn error:&error];
 	if (!pipeline) std::fprintf(stderr, "%s\n", error.localizedDescription.UTF8String);
@@ -515,7 +523,9 @@ static void DeviceBackedLds() {
 	[encoder setBytes:sizes length:sizeof(sizes) atIndex:25];
 	[encoder setBuffer:scratch offset:0 atIndex:ShaderRecompiler::Msl::DeviceLdsBufferIndex];
 	[encoder useResource:output usage:MTLResourceUsageWrite];
-	[encoder dispatchThreadgroups:MTLSizeMake(2, 2, 2) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+	const uint32_t metal_threads = paired ? guest_threads / 2u : guest_threads;
+	Check(pipeline.maxTotalThreadsPerThreadgroup >= metal_threads, "device-backed LDS workgroup unsupported");
+	[encoder dispatchThreadgroups:MTLSizeMake(2, 2, 2) threadsPerThreadgroup:MTLSizeMake(metal_threads, 1, 1)];
 	[encoder endEncoding];
 	[command commit];
 	[command waitUntilCompleted];
@@ -524,7 +534,7 @@ static void DeviceBackedLds() {
 	for (uint32_t i = 0; i < 8; ++i) {
 		Check(values[i] == 100u + i, "device-backed LDS barrier or group isolation failed");
 	}
-	std::puts("Device-backed LDS: final dword shared across SIMD groups in eight isolated workgroups");
+	std::printf("Device-backed LDS: final dword shared across SIMD groups in eight isolated %u-thread workgroups\n", metal_threads);
 }
 
 static void SubwordLoads() {
@@ -1019,7 +1029,7 @@ int main() {
 	@autoreleasepool {
 		try {
 			device = MTLCreateSystemDefaultDevice(); Check(device != nil, "Metal device unavailable");
-			ImageSampling(); StorageImageChannelMapping(); PixelInterpolation(); LocalAppendConsume(); FloatClasses(); PackFloat2x16Rtz(); Shifts64(); FormattedStores(); RawBufferBounds(); DeclaredLds(); LargeLdsEmission(); DeviceBackedLds(); SubwordLoads(); GuestAddressLoads(); DualSourceOutput(); VertexReadFirstLane();
+			ImageSampling(); StorageImageChannelMapping(); PixelInterpolation(); LocalAppendConsume(); FloatClasses(); PackFloat2x16Rtz(); Shifts64(); FormattedStores(); RawBufferBounds(); DeclaredLds(); LargeLdsEmission(); DeviceBackedLds(); DeviceBackedLds(true); SubwordLoads(); GuestAddressLoads(); DualSourceOutput(); VertexReadFirstLane();
 			IndirectRectList(); LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();
 			setenv("KYTY_MSL_DISPATCHER", "1", 1);
 			LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();

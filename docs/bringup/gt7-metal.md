@@ -139,7 +139,6 @@ completed command buffers above the trace threshold of 20 ms reached 65.8 ms
 in this interval. This measurement covers a command buffer, which may contain
 several passes and need not align with one frame. Set `KYTY_GPU_BUSY=1` to
 measure the proportion of wall time occupied by completed Metal work.
-Reporting a 120 Hz virtual VBlank kept the 3840×2160 allocations in the tested
-World Map. The 120 Hz run measured a median of 8.5 fps in seven steady samples.
-The default 60 Hz title profile also measured a median of 8.5 fps across 17
-steady samples. Both runs rendered internally at 3840×2160.
+With the same default title profile, the 60 Hz and 120 Hz virtual VBlank runs
+both used 3840×2160 in the World Map. Over guest flips 1500–1599, the two runs
+measured 8.4 and 8.5 fps, respectively, with six samples in each interval.

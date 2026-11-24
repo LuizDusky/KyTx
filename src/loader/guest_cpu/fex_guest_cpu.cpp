@@ -308,6 +308,9 @@ struct ThreadState {
 	static constexpr int                        kMaxHleRegsDepth = 16;
 	GuestRegs                                   hle_regs[kMaxHleRegsDepth] {};
 	int                                         hle_regs_depth = 0;
+	GuestContinuation                           continuation {};
+	uint64_t                                    continuation_result = 0;
+	int                                         continuation_depth = 0;
 	HostCallFrame                               bridge[kMaxBridgeDepth] {};
 	int                                         bridge_depth = 0;
 	uint64_t                                    callret_alloc = 0; // call-ret stack incl. guard pages
@@ -555,6 +558,7 @@ void DispatchHle(FEXCore::Core::CpuStateFrame* frame, uint64_t index) {
 		*reinterpret_cast<__uint128_t*>(&f.v[i]) = *reinterpret_cast<const __uint128_t*>(st.xmm.sse.data[i]);
 	}
 
+
 	const auto n = g->hle_calls.fetch_add(1, std::memory_order_relaxed);
 	// Restrict a diagnostic HLE trace to one guest module without spending its
 	// quota on unrelated rendering/thread calls (begin:end, end exclusive).
@@ -592,8 +596,32 @@ void DispatchHle(FEXCore::Core::CpuStateFrame* frame, uint64_t index) {
 		             static_cast<unsigned long long>(tid));
 	}
 
+	const auto dispatch_depth = ts->hle_regs_depth;
 	if (__builtin_expect(ts->hle_regs_depth > 0, 1)) {
 		--ts->hle_regs_depth;
+	}
+	if (ts->continuation_depth != 0 && ts->continuation_depth == dispatch_depth) {
+		const auto& resume = ts->continuation;
+		st.gregs[X86::REG_RBX] = resume.rbx;
+		st.gregs[X86::REG_RBP] = resume.rbp;
+		st.gregs[X86::REG_RDI] = resume.rdi;
+		st.gregs[X86::REG_RSI] = resume.rsi;
+		st.gregs[X86::REG_R12] = resume.r12;
+		st.gregs[X86::REG_R13] = resume.r13;
+		st.gregs[X86::REG_R14] = resume.r14;
+		st.gregs[X86::REG_R15] = resume.r15;
+		// FEX can translate syscall and the stub's ret in the same block. Put the
+		// continuation on the destination stack so that ret restores both RIP and RSP.
+		st.gregs[X86::REG_RSP] = resume.rsp - sizeof(uint64_t);
+		*reinterpret_cast<uint64_t*>(st.gregs[X86::REG_RSP]) = resume.rip;
+		st.gregs[X86::REG_RAX] = ts->continuation_result;
+		st.rip                = rip + 2;
+		st.mxcsr              = resume.mxcsr;
+		st.FCW                = resume.fcw;
+		// Predicted native return addresses belong to the previous guest stack.
+		st.callret_sp = CallRetDefault(ts->callret_alloc);
+		ts->continuation_depth = 0;
+		return;
 	}
 	st.gregs[X86::REG_RAX] = f.ret_x0;
 	st.gregs[X86::REG_RDX] = f.ret_x1;
@@ -817,6 +845,32 @@ bool GetCurrentGuestRegs(GuestRegs* out) {
 	}
 	*out = t_state->hle_regs[t_state->hle_regs_depth - 1];
 	return true;
+}
+
+bool CaptureContinuation(GuestContinuation* continuation) {
+	GuestRegs regs {};
+	if (!GetCurrentGuestRegs(&regs)) {
+		return false;
+	}
+	const auto& state = State(t_state);
+	*continuation = {
+	    regs.gpr[X86::REG_RBX], regs.gpr[X86::REG_RBP],
+	    regs.gpr[X86::REG_RDI], regs.gpr[X86::REG_RSI],
+	    regs.gpr[X86::REG_R12], regs.gpr[X86::REG_R13],
+	    regs.gpr[X86::REG_R14], regs.gpr[X86::REG_R15],
+	    regs.gpr[X86::REG_RSP] + sizeof(uint64_t), regs.rip,
+	    state.mxcsr, state.FCW,
+	};
+	return true;
+}
+
+void ResumeContinuation(const GuestContinuation& continuation, uint64_t result) {
+	if (t_state == nullptr || t_state->hle_regs_depth == 0 || t_state->continuation_depth != 0) {
+		std::abort();
+	}
+	t_state->continuation = continuation;
+	t_state->continuation_result = result;
+	t_state->continuation_depth = t_state->hle_regs_depth;
 }
 
 bool GetFaultGuestLocation(uint64_t host_pc, GuestFaultLocation* out) {

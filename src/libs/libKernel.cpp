@@ -2452,6 +2452,9 @@ struct FiberOptParam {
 	uint32_t magic;
 };
 
+#if KYTY_GUEST_CPU_EMULATED
+using FiberCpuContext = Loader::GuestCpu::GuestContinuation;
+#else
 struct FiberCpuContext {
 	uint64_t rbx;
 	uint64_t rbp;
@@ -2466,6 +2469,7 @@ struct FiberCpuContext {
 };
 
 static_assert(sizeof(FiberCpuContext) == 80);
+#endif
 
 struct FiberObject {
 	uint32_t        magic_start;
@@ -2483,6 +2487,9 @@ struct FiberObject {
 	FiberCpuContext saved_context;
 	uint64_t        arg_on_run;
 	uint64_t        arg_on_return;
+#if KYTY_GUEST_CPU_EMULATED
+	uint64_t*       arg_on_resume;
+#endif
 	bool            context_valid;
 	uint32_t        magic_end;
 };
@@ -2512,6 +2519,9 @@ struct FiberThreadContext {
 	FiberObject*    returned_fiber;
 	FiberObject*    pending_idle_fiber;
 	FiberCpuContext cpu_context;
+#if KYTY_GUEST_CPU_EMULATED
+	uint64_t*       arg_on_return;
+#endif
 };
 
 static const auto g_fiber_context_key = [] {
@@ -2579,6 +2589,52 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 	fiber->context       = valid ? &fiber->saved_context : nullptr;
 }
 
+#if KYTY_GUEST_CPU_EMULATED
+static thread_local FiberThreadContext g_emulated_fiber_thread;
+
+static void FiberResumeThread(FiberThreadContext* context, uint64_t value, int32_t result) {
+	if (context->arg_on_return != nullptr) {
+		*context->arg_on_return = value;
+	}
+	Loader::GuestCpu::ResumeContinuation(context->cpu_context, static_cast<uint32_t>(result));
+	FiberCompleteSwitch(nullptr);
+	FiberSetThreadContext(nullptr);
+}
+
+static void FiberFinishEmulated() {
+	auto* context = FiberGetThreadContext();
+	auto* fiber = context->current_fiber;
+	FiberSetContextValid(fiber, false);
+	FiberStoreState(fiber, FIBER_STATE_TERMINATED);
+	FiberResumeThread(context, 0, FIBER_ERROR_STATE);
+}
+
+static void FiberEnterEmulated(FiberObject* fiber) {
+	if (fiber->context_valid) {
+		if (fiber->arg_on_resume != nullptr) {
+			*fiber->arg_on_resume = fiber->arg_on_run;
+			fiber->arg_on_resume = nullptr;
+		}
+		Loader::GuestCpu::ResumeContinuation(fiber->saved_context, OK);
+	} else {
+		static const auto finish = Loader::GuestCpu::GetHostFunctionStub(
+		    reinterpret_cast<uint64_t>(&FiberFinishEmulated), "Fiber::FinishEmulated");
+		const auto stack_top = reinterpret_cast<uint64_t>(fiber->context_end) & ~uint64_t {15};
+		// The finish stub also enters HLE, so leave a readable frame below the stack end.
+		auto* stack = reinterpret_cast<uint64_t*>(stack_top - 3 * sizeof(uint64_t));
+		stack[0] = finish;
+		stack[1] = 0;
+		stack[2] = 0;
+		FiberCpuContext initial {};
+		initial.rsp = reinterpret_cast<uint64_t>(stack);
+		initial.rip = reinterpret_cast<uint64_t>(fiber->entry);
+		initial.rdi = fiber->arg_on_initialize;
+		initial.rsi = fiber->arg_on_run;
+		Loader::GuestCpu::ResumeContinuation(initial, OK);
+	}
+	FiberCompleteSwitch(fiber);
+}
+#else
 #if defined(__x86_64__) || defined(_M_X64)
 [[gnu::naked,
   gnu::returns_twice]] static KYTY_SYSV_ABI int FiberSaveContext(FiberCpuContext* /*ctx*/) {
@@ -2661,6 +2717,7 @@ static int FiberSaveContext(FiberCpuContext* ctx) {
 
 	FiberRestoreContext(&context->cpu_context, 1);
 }
+#endif
 
 int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, FiberEntry entry,
                                       uint64_t arg_on_initialize, void* addr_context,
@@ -2702,7 +2759,7 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 	fiber->context_start     = addr_context;
 	fiber->context_end =
 	    (addr_context != nullptr ? static_cast<uint8_t*>(addr_context) + size_context : nullptr);
-	std::memset(&fiber->saved_context, 0, sizeof(fiber->saved_context));
+	fiber->saved_context = {};
 	FiberSetContextValid(fiber, false);
 	fiber->magic_end = FIBER_MAGIC_END;
 
@@ -2772,12 +2829,27 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	if (FiberGetThreadContext() != nullptr) {
 		return FIBER_ERROR_PERMISSION;
 	}
+#if KYTY_GUEST_CPU_EMULATED
+	FiberCpuContext caller {};
+	if (fiber->addr_context == nullptr || !Loader::GuestCpu::CaptureContinuation(&caller)) {
+		return FIBER_ERROR_INVALID;
+	}
+#endif
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
 		return FIBER_ERROR_STATE;
 	}
 
 	fiber->arg_on_run    = arg_on_run;
 	fiber->arg_on_return = 0;
+#if KYTY_GUEST_CPU_EMULATED
+	auto& context = g_emulated_fiber_thread;
+	context = {};
+	context.cpu_context = caller;
+	context.arg_on_return = arg_on_return;
+	FiberSetThreadContext(&context);
+	FiberEnterEmulated(fiber);
+	return OK;
+#else
 	// Register on the host stack; switching fibers only reads the native TLS slot.
 	FiberThreadContext context {};
 	FiberSetThreadContext(&context);
@@ -2802,6 +2874,7 @@ int32_t KYTY_SYSV_ABI FiberRun(FiberObject* fiber, uint64_t arg_on_run, uint64_t
 	}
 
 	return return_code;
+#endif
 }
 
 int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
@@ -2816,15 +2889,27 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 		return FIBER_ERROR_PERMISSION;
 	}
 
+	auto* caller = context->current_fiber;
+#if KYTY_GUEST_CPU_EMULATED
+	FiberCpuContext saved_context {};
+	if (fiber->addr_context == nullptr || !Loader::GuestCpu::CaptureContinuation(&saved_context)) {
+		return FIBER_ERROR_INVALID;
+	}
+#endif
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_RUNNING)) {
 		return FIBER_ERROR_STATE;
 	}
 
-	auto* caller = context->current_fiber;
-
 	fiber->arg_on_run    = arg_on_run;
 	fiber->arg_on_return = 0;
 
+#if KYTY_GUEST_CPU_EMULATED
+	caller->saved_context = saved_context;
+	caller->arg_on_resume = arg_on_return;
+	FiberSetContextValid(caller, true);
+	context->pending_idle_fiber = caller;
+	FiberEnterEmulated(fiber);
+#else
 	if (FiberSaveContext(&caller->saved_context) == 0) {
 		FiberSetContextValid(caller, true);
 		context->pending_idle_fiber = caller;
@@ -2839,6 +2924,7 @@ int32_t KYTY_SYSV_ABI FiberSwitch(FiberObject* fiber, uint64_t arg_on_run,
 	if (arg_on_return != nullptr) {
 		*arg_on_return = caller->arg_on_run;
 	}
+#endif
 
 	return OK;
 }
@@ -2867,6 +2953,15 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_
 	auto* fiber          = context->current_fiber;
 	fiber->arg_on_return = arg_on_return;
 
+#if KYTY_GUEST_CPU_EMULATED
+	if (!Loader::GuestCpu::CaptureContinuation(&fiber->saved_context)) {
+		return FIBER_ERROR_PERMISSION;
+	}
+	fiber->arg_on_resume = arg_on_run;
+	FiberSetContextValid(fiber, true);
+	context->pending_idle_fiber = fiber;
+	FiberResumeThread(context, arg_on_return, OK);
+#else
 	if (FiberSaveContext(&fiber->saved_context) == 0) {
 		FiberSetContextValid(fiber, true);
 		context->returned_fiber = fiber;
@@ -2878,6 +2973,7 @@ int32_t KYTY_SYSV_ABI FiberReturnToThread(uint64_t arg_on_return, uint64_t* arg_
 	if (arg_on_run != nullptr) {
 		*arg_on_run = fiber->arg_on_run;
 	}
+#endif
 
 	return OK;
 }

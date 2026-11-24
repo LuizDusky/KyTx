@@ -367,6 +367,22 @@ static void DeclaredLds() {
 	std::memcpy(&actual,output.data()+8,4); Check(actual==0,"inactive LDS read did not return zero");
 }
 
+static void LargeLdsEmission() {
+	Fixture f;
+	ShaderComputeInputInfo compute {};
+	compute.lds_size_dwords = 9000;
+	ShaderStageInputInfo input {};
+	input.compute = &compute;
+	f.program.memory_info.push_back({.kind = IR::ResourceKind::Lds});
+	f.Emit(0, ValueOpcode::WriteSharedU32,
+	       {Value(8999u * 4), Value(0x12345678u), Value(true)}, 0);
+	const auto result = ShaderRecompiler::Msl::EmitProgram(f.program, input);
+	Check(result.success && result.source.find("kyty_lds[9000]") != std::string::npos,
+	      "MSL silently shortened guest LDS");
+	std::printf("Large LDS emission: 36000 guest bytes retained (device limit %lu)\n",
+	            static_cast<unsigned long>(device.maxThreadgroupMemoryLength));
+}
+
 static void SubwordLoads() {
 	Fixture f(2);
 	const auto buffer = f.Buffer(0);
@@ -859,7 +875,7 @@ int main() {
 	@autoreleasepool {
 		try {
 			device = MTLCreateSystemDefaultDevice(); Check(device != nil, "Metal device unavailable");
-			ImageSampling(); PixelInterpolation(); LocalAppendConsume(); FloatClasses(); PackFloat2x16Rtz(); Shifts64(); FormattedStores(); RawBufferBounds(); DeclaredLds(); SubwordLoads(); GuestAddressLoads(); DualSourceOutput(); VertexReadFirstLane();
+			ImageSampling(); PixelInterpolation(); LocalAppendConsume(); FloatClasses(); PackFloat2x16Rtz(); Shifts64(); FormattedStores(); RawBufferBounds(); DeclaredLds(); LargeLdsEmission(); SubwordLoads(); GuestAddressLoads(); DualSourceOutput(); VertexReadFirstLane();
 			IndirectRectList(); LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();
 			setenv("KYTY_MSL_DISPATCHER", "1", 1);
 			LoopPhiSwap(); DiamondPhi(true); DiamondPhi(false); NestedLoops();

@@ -791,7 +791,12 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword) {
-		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+		auto backend_options = options;
+#if defined(__APPLE__)
+		backend_options.metal_guest_address_space =
+		    options.stage == ShaderType::Mesh && Metal::UseNativeMetalBackend();
+#endif
+		auto result = ShaderRecompiler::CompileProgram(std::move(translated), backend_options,
 		                                               specialization, push_data_start_dword);
 
 		// KYTY_MSL_DIRECT=<0|1|2>: exercise the direct RDNA->MSL emitter alongside the
@@ -840,7 +845,9 @@ struct PipelineCache::ProgramCache {
 
 #if defined(__APPLE__)
 		if (Metal::UseNativeMetalBackend()) {
-			const uint64_t metal_hash = options.shader_hash ^ MetalFunctionVariant(options);
+			// Compiled mesh shaders use a different guest-address and argument-buffer layout.
+			const uint64_t mesh_revision = options.stage == ShaderType::Mesh ? 0x97470a932deaf19bull : 0;
+			const uint64_t metal_hash = options.shader_hash ^ MetalFunctionVariant(options) ^ mesh_revision;
 			// KYTY_MSL_BACKEND=1 compiles the direct RDNA->MSL translation. Shaders
 			// the MSL backend cannot express fall back to the SPIR-V path below.
 			static const bool s_msl_backend = [] {
@@ -863,7 +870,7 @@ struct PipelineCache::ProgramCache {
 				const char* value = std::getenv("KYTY_MSL_ONLY");
 				return value != nullptr && value[0] == '1';
 			}();
-			if (s_msl_only) {
+			if (s_msl_only && options.stage != ShaderType::Mesh) {
 				auto msl = ShaderRecompiler::Msl::EmitProgram(result.program, options.input_info);
 				uint64_t msl_hash = Metal::NativeMslFunctionKey(
 				    metal_hash, static_cast<uint32_t>(options.stage), msl.source, msl.success);
@@ -949,7 +956,7 @@ struct PipelineCache::ProgramCache {
 				    .handle         = {.id = id, .module = nullptr},
 				};
 			}
-			if (s_msl_backend && msl_stage_allowed) {
+			if (s_msl_backend && msl_stage_allowed && options.stage != ShaderType::Mesh) {
 				auto msl = ShaderRecompiler::Msl::EmitProgram(result.program, options.input_info);
 				if (msl.success) {
 					const uint64_t msl_hash = Metal::NativeMslFunctionKey(
@@ -974,8 +981,12 @@ struct PipelineCache::ProgramCache {
 				     options.shader_hash, msl.unsupported.size());
 			}
 			const auto spvc_abi = Metal::ComputeSpvcAbiLayout(result.program.bindings, options.stage);
-			Metal::MetalShaderManager::Instance().CompileSpirvToFunction(
+			const auto compiled = Metal::MetalShaderManager::Instance().CompileSpirvToFunction(
 			    result.spirv, "main0", static_cast<uint32_t>(options.stage), metal_hash, &spvc_abi);
+			if (options.stage == ShaderType::Mesh && !compiled.success) {
+				std::fprintf(stderr, "[MetalMesh] compiler failed for 0x%016" PRIx64 ": %s\n",
+				             options.shader_hash, compiled.error_log.c_str());
+			}
 			const auto id = ++next_shader_id;
 			auto info = std::move(result.program).TakeCompiledInfo();
 			info.shader_hash = metal_hash;
@@ -1459,21 +1470,28 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
-		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
-		auto& mesh              = vertex_info[0].mesh;
-		mesh.host_subgroup_size = m_graphics.subgroup_size;
-		const auto& limits      = m_graphics.mesh_shader_properties;
-		const auto  logical_threads =
-		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
-		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
-		                          std::min(mesh.host_subgroup_size, mesh.wave_size);
-		if (host_threads > limits.maxMeshWorkGroupInvocations ||
-		    host_threads > limits.maxMeshWorkGroupSize[0] ||
-		    mesh.max_vertices > limits.maxMeshOutputVertices ||
-		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
-		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+#if defined(__APPLE__)
+		if (Metal::UseNativeMetalBackend()) {
+			vertex_info[0].mesh.host_subgroup_size = 32;
+		} else
+#endif
+		{
+			EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
+			auto& mesh              = vertex_info[0].mesh;
+			mesh.host_subgroup_size = m_graphics.subgroup_size;
+			const auto& limits      = m_graphics.mesh_shader_properties;
+			const auto  logical_threads =
+			    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
+			const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
+			                          std::min(mesh.host_subgroup_size, mesh.wave_size);
+			if (host_threads > limits.maxMeshWorkGroupInvocations ||
+			    host_threads > limits.maxMeshWorkGroupSize[0] ||
+			    mesh.max_vertices > limits.maxMeshOutputVertices ||
+			    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
+			    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
+				EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
+				     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+			}
 		}
 	}
 	ShaderParams pixel_params;

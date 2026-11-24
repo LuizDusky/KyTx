@@ -567,6 +567,46 @@ static void AddMissingVertexVaryings(std::string& msl) {
 	}
 }
 
+// SPIRV-Cross stages triangle indices in an array of 16-byte uint3s before
+// exporting the mesh. Each guest index is ten bits, so the staging array can
+// preserve the same values in one dword per triangle.
+static void PackMeshTriangleIndices(std::string& msl) {
+	static const std::regex declaration(
+	    R"(threadgroup uint3 gl_PrimitiveTriangleIndicesEXT\[(\d+)\];)");
+	static const std::regex parameter(
+	    R"(threadgroup uint3 \(&gl_PrimitiveTriangleIndicesEXT\)\[(\d+)\])");
+	static const std::regex store(
+	    R"(gl_PrimitiveTriangleIndicesEXT\[([^\]]+)\] = (uint3\([^;]+\));)");
+	static const std::regex load(
+	    R"(gl_PrimitiveTriangleIndicesEXT\[([^\]]+)\]\.([xyz]))");
+	if (!std::regex_search(msl, declaration) || !std::regex_search(msl, store) ||
+	    !std::regex_search(msl, load)) {
+		return;
+	}
+
+	auto packed = std::regex_replace(msl, declaration, "threadgroup uint gl_PrimitiveTriangleIndicesEXT[$1];");
+	packed = std::regex_replace(packed, parameter, "threadgroup uint (&gl_PrimitiveTriangleIndicesEXT)[$1]");
+	packed = std::regex_replace(packed, store, "gl_PrimitiveTriangleIndicesEXT[$1] = kyty_pack_triangle($2);");
+	for (uint32_t component = 0; component < 3u; ++component) {
+		const std::string suffix(1, "xyz"[component]);
+		const std::regex component_load(
+		    R"(gl_PrimitiveTriangleIndicesEXT\[([^\]]+)\]\.)" + suffix);
+		packed = std::regex_replace(
+		    packed, component_load,
+		    "extract_bits(gl_PrimitiveTriangleIndicesEXT[$1], " + std::to_string(component * 10u) + "u, 10u)");
+	}
+	const auto metal_std = packed.find("#include <metal_stdlib>");
+	if (metal_std == std::string::npos) {
+		return;
+	}
+	const auto insert_at = packed.find('\n', metal_std) + 1;
+	packed.insert(insert_at,
+	    "static inline uint kyty_pack_triangle(metal::uint3 indices) {\n"
+	    "    return indices.x | (indices.y << 10u) | (indices.z << 20u);\n"
+	    "}\n\n");
+	msl = std::move(packed);
+}
+
 MetalShaderCompileResult MetalShaderManager::CompileSpirvToFunction(
     std::span<const uint32_t> spirv,
     const char* entry_point,
@@ -607,7 +647,8 @@ MetalShaderCompileResult MetalShaderManager::CompileSpirvToFunction(
 		// KYTY_SPVC_ABI: pin every descriptor to the id range from ComputeSpvcAbiLayout so arrays
 		// no longer take consecutive ids that collide with the neighbouring kinds.
 		static const bool s_spvc_abi = KYTY_ENV("KYTY_SPVC_ABI") != nullptr;
-		if (s_spvc_abi && abi != nullptr) {
+		const bool mesh_stage = stage == static_cast<uint32_t>(ShaderType::Mesh);
+		if ((s_spvc_abi || mesh_stage) && abi != nullptr) {
 			const auto model = compiler.get_execution_model();
 			for (const auto& e: abi->entries) {
 				spirv_cross::MSLResourceBinding rb {};
@@ -627,11 +668,26 @@ MetalShaderCompileResult MetalShaderManager::CompileSpirvToFunction(
 			}
 		}
 
+		if (mesh_stage) {
+			spirv_cross::MSLResourceBinding push {};
+			push.stage = compiler.get_execution_model();
+			push.desc_set = spirv_cross::kPushConstDescSet;
+			push.binding = spirv_cross::kPushConstBinding;
+			push.msl_buffer = 1;
+			compiler.add_msl_resource_binding(push);
+		}
 		result.msl_source = SanitizeMslSource(compiler.compile());
+		if (mesh_stage) {
+			PackMeshTriangleIndices(result.msl_source);
+			if (KYTY_ENV("KYTY_METAL_MESH_SINGLE_LAYER") != nullptr) {
+				static const std::regex layer_output(R"(spvP\.gl_Layer = [^;]+;)");
+				result.msl_source = std::regex_replace(result.msl_source, layer_output, "spvP.gl_Layer = 0u;");
+			}
+		}
 		if (result.msl_source.find("[[buffer(0)]]") != std::string::npos) {
 			RecordArgBuffer0(shader_hash);
 		}
-		{
+		if (!mesh_stage) {
 			// Diagnostic: total threadgroup memory declared by this MSL (Metal limit 32768 bytes).
 			size_t tg_total = 0;
 			for (size_t pos = 0; (pos = result.msl_source.find("threadgroup ", pos)) != std::string::npos; ++pos) {

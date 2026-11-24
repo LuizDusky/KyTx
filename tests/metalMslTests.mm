@@ -154,6 +154,7 @@ static void ImageSampling() {
 		bool derivative;
 		int gather_component; // -1 = sample
 		uint32_t expected_layer;
+		bool cube = false;
 	};
 	const Case cases[] = {
 	    {"2D explicit LOD", Dimension::Dim2D, 0, false, -1, 0},
@@ -169,6 +170,7 @@ static void ImageSampling() {
 	    {"gather green", Dimension::Dim2D, 0, false, 1, 0},
 	    {"array gather blue", Dimension::Dim2DArray, 1, false, 2, 1},
 	    {"array gather alpha", Dimension::Dim2DArray, 0.51f, false, 3, 1},
+	    {"compute cube face", Dimension::Dim2DArray, 2, false, -1, 2, true},
 	};
 	unsigned failures = 0;
 	for (const auto& test: cases) {
@@ -185,6 +187,7 @@ static void ImageSampling() {
 			image.mip_mode = IR::ImageMipMode::Dynamic;
 			image.mip_count = 5;
 			image.read = true;
+			image.cube = test.cube;
 			f.program.info.images.push_back(image);
 			f.program.info.samplers.emplace_back();
 			f.program.bindings.descriptors.push_back({*IR::DescriptorBindingForImage(image), {0}});
@@ -233,7 +236,7 @@ static void ImageSampling() {
 			MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
 			    width:16 height:16 mipmapped:YES];
 			descriptor.textureType = arrayed ? MTLTextureType2DArray : volume ? MTLTextureType3D : MTLTextureType2D;
-			descriptor.arrayLength = arrayed ? 3 : 1;
+			descriptor.arrayLength = test.cube ? 6 : arrayed ? 3 : 1;
 			descriptor.depth = volume ? 16 : 1;
 			descriptor.storageMode = MTLStorageModeShared;
 			descriptor.usage = MTLTextureUsageShaderRead;

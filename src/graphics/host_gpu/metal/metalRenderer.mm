@@ -572,7 +572,15 @@ static id<MTLTexture> ApplyDstSel(id<MTLTexture> texture, const Tex& tex) {
 	if (texture == nil) {
 		return nil;
 	}
-	const uint32_t sel[4] = {tex.DstSelX(), tex.DstSelY(), tex.DstSelZ(), tex.DstSelW()};
+	uint32_t sel[4] = {tex.DstSelX(), tex.DstSelY(), tex.DstSelZ(), tex.DstSelW()};
+	if (tex.Format() == Prospero::BufferFormat::k10_11_11Float) {
+		// Interpret the packed guest channels through Metal's reversed red and blue.
+		for (auto& component: sel) {
+			if (component == 4 || component == 6) {
+				component = 10 - component;
+			}
+		}
+	}
 	if (sel[0] == 4 && sel[1] == 5 && sel[2] == 6 && sel[3] == 7) {
 		return texture;
 	}
@@ -3031,10 +3039,23 @@ static std::array<NativeColorTargetLayout, 8> NativeColorLayout(const HW::Contex
 	return layout;
 }
 
-static void ConfigureNativeColorTargets(MetalRenderPipelineKey& key, const HW::Context& context) {
+static void ConfigureNativeColorTargets(MetalRenderPipelineKey& key, const HW::Context& context,
+                                        const ShaderPixelInputInfo& pixel) {
 	const auto layout = NativeColorLayout(context);
 	for (uint32_t slot = 0; slot < layout.size(); ++slot) {
 		if (layout[slot].address != 0) ConfigureNativeColorTarget(key, context, slot, layout[slot].format);
+	}
+	if (pixel.alpha_blend_source_remap && key.color_targets[0].blending_enabled) {
+		auto remap = [](MTLBlendFactor factor) {
+			if (factor == MTLBlendFactorSourceAlpha) return MTLBlendFactorSource1Color;
+			if (factor == MTLBlendFactorOneMinusSourceAlpha) return MTLBlendFactorOneMinusSource1Color;
+			return factor;
+		};
+		auto& color = key.color_targets[0];
+		color.src_rgb = remap(color.src_rgb);
+		color.dst_rgb = remap(color.dst_rgb);
+		color.src_alpha = remap(color.src_alpha);
+		color.dst_alpha = remap(color.dst_alpha);
 	}
 }
 
@@ -4693,7 +4714,8 @@ static MetalBufferAllocation GuestGpuAllocation(uint64_t vaddr, size_t size) {
 
 static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
                                      const ShaderPixelInputInfo& ps_info,
-                                     bool pixel_active) {
+                                     bool pixel_active,
+                                     std::span<const uint32_t> mesh_draw = {}) {
 	s_draw_seq.fetch_add(1, std::memory_order_relaxed);
 	s_trace_draw_inputs.clear();
 	s_trace_draw_bufs.clear();
@@ -4796,7 +4818,14 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 			dump("ps", ps_info.stage, ps_push_data);
 		}
 	}
-	MetalDrawExecutor::Instance().SetVertexBytes(&vs_push_data, sizeof(vs_push_data), 1);
+	if (mesh_draw.empty()) {
+		MetalDrawExecutor::Instance().SetVertexBytes(&vs_push_data, sizeof(vs_push_data), 1);
+	} else {
+		std::copy(mesh_draw.begin(), mesh_draw.end(), vs_push_data.dwords.begin());
+		std::copy(mesh_draw.begin(), mesh_draw.end(), ps_push_data.dwords.begin());
+		[MetalContext::Instance().GetActiveRenderEncoder() setMeshBytes:&vs_push_data
+		                                                        length:sizeof(vs_push_data) atIndex:1];
+	}
 	MetalDrawExecutor::Instance().SetFragmentBytes(&ps_push_data, sizeof(ps_push_data), 1);
 
 	// 2. Buffer 25: spvBufferSizeConstants (buffer bounds)
@@ -5335,14 +5364,15 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 					static const bool s_log_unbound = KYTY_ENV("KYTY_LOG_UNBOUND") != nullptr;
 					if (s_log_unbound) {
 						static std::mutex s_ub_mutex;
-						static std::set<std::pair<uint64_t, uint32_t>> s_ub_seen;
+						static std::set<std::tuple<uint64_t, uint32_t, bool, bool>> s_ub_seen;
 						std::lock_guard<std::mutex> ub_lock(s_ub_mutex);
-						if (s_ub_seen.insert({stage.program->shader_hash, i}).second) {
-							ShaderTextureResource tex {};
-							const bool has_desc = stage.resources != nullptr && i < stage.resources->images.size();
-							if (has_desc) for (size_t f = 0; f < 8; ++f) tex.fields[f] = stage.resources->images[i].dwords[f];
-							std::fprintf(stderr, "[Unbound] %c hash=%016llx slot=%u desc=%d null=%d dim=%d addr=0x%llx %ux%u fmt=%u type=%u tile=%u lvls=%u-%u dst_sel=%u%u%u%u d=%08x %08x %08x %08x\n",
-							             args == ps_args ? 'P' : 'V', (unsigned long long)stage.program->shader_hash, i, has_desc ? 1 : 0,
+						ShaderTextureResource tex {};
+						const bool has_desc = stage.resources != nullptr && i < stage.resources->images.size();
+						if (has_desc) std::copy_n(stage.resources->images[i].dwords.begin(), 8, tex.fields);
+						const auto& image = stage.program->info.images[i];
+						if (s_ub_seen.emplace(stage.program->shader_hash, i, has_desc, tex.IsNull()).second) {
+							std::fprintf(stderr, "[Unbound] %c hash=%016llx guest=%016llx slot=%u source=%u pc=0x%x desc=%d null=%d dim=%d addr=0x%llx %ux%u fmt=%u type=%u tile=%u lvls=%u-%u dst_sel=%u%u%u%u d=%08x %08x %08x %08x\n",
+							             args == ps_args ? 'P' : 'V', (unsigned long long)stage.program->shader_hash, (unsigned long long)stage.program->guest_hash, i, image.source, image.first_use_pc, has_desc ? 1 : 0,
 							             tex.IsNull() ? 1 : 0,
 							             static_cast<int>(stage.program->info.images[i].dimension), (unsigned long long)tex.Base40(),
 							             static_cast<unsigned>(tex.Width5()) + 1u, static_cast<unsigned>(tex.Height5()) + 1u, (unsigned)tex.Format(),
@@ -5393,7 +5423,7 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 				continue;
 			}
 			static const bool s_spvc_abi_slot = KYTY_ENV("KYTY_SPVC_ABI") != nullptr;
-			if (s_spvc_abi_slot) {
+			if (s_spvc_abi_slot || stage.program->stage == ShaderType::Mesh) {
 				const auto layout = Libs::Graphics::Metal::ComputeSpvcAbiLayout(stage.program->bindings, stage.program->stage);
 				slot = layout.BaseOf(binding.kind) + static_cast<uint32_t>(it - binding.resources.begin());
 				return true;
@@ -5411,7 +5441,8 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 	                                 int vertex_count) {
 		// KYTY_SPVC_ABI: resource ids come from the per-shader layout, not the legacy offsets.
 		static const bool s_spvc_abi_bind = KYTY_ENV("KYTY_SPVC_ABI") != nullptr;
-		const bool abi_on = s_spvc_abi_bind && stage.program != nullptr;
+		const bool abi_on = stage.program != nullptr &&
+		                    (s_spvc_abi_bind || stage.program->stage == ShaderType::Mesh);
 		const auto abi_layout = abi_on ? Libs::Graphics::Metal::ComputeSpvcAbiLayout(stage.program->bindings, stage.program->stage)
 		                               : Libs::Graphics::Metal::SpvcAbiLayout {};
 		using DescKind = ShaderRecompiler::IR::DescriptorBindingKind;
@@ -5423,6 +5454,15 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 		const uint32_t abi_buf  = abi_on ? AbiBaseOr256(DescKind::Buffers) : base;
 		const uint32_t abi_srt  = abi_on ? AbiBaseOr256(DescKind::FlattenedSrt) : base + 53;
 		const uint32_t abi_samp = abi_on ? AbiBaseOr256(DescKind::Samplers) : base + 49;
+		const bool mesh_stage = stage.program != nullptr && stage.program->stage == ShaderType::Mesh;
+		if (mesh_stage) {
+			const uint32_t bda_index = AbiBaseOr256(DescKind::BdaPagetable);
+			if (bda_index < 256u) {
+				if (auto root = BindGuestAddressSpaceBuffer(true)) {
+					s_vs_caps.push_back({bda_index, root, 0, nil, nil});
+				}
+			}
+		}
 		for (int i = 0; vertex_buffers != nullptr && i < vertex_count && i < 5; ++i) {
 			const auto ga = GuestGpuAllocation(
 			    vertex_buffers[i].addr,
@@ -5486,7 +5526,11 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 				}
 				if (ga.gpu_addr != 0) {
 					if (abi_buf + b < 256u) args[abi_buf + b] = ga.gpu_addr;
-					if (abi_buf + b < 256u) (args == ps_args ? s_ps_caps : s_vs_caps).push_back({static_cast<uint32_t>(abi_buf + b), ga.buffer, ga.offset & ~static_cast<NSUInteger>(255), nil, nil});
+					if (abi_buf + b < 256u) {
+						const auto offset = mesh_stage ? ga.offset : ga.offset & ~static_cast<NSUInteger>(255);
+						(args == ps_args ? s_ps_caps : s_vs_caps).push_back({static_cast<uint32_t>(abi_buf + b), ga.buffer, offset, nil, nil});
+						if (mesh_stage) vs_sizes[b] = static_cast<uint32_t>(std::min<uint64_t>(ga.size, UINT32_MAX));
+					}
 				}
 			}
 			{
@@ -5681,7 +5725,7 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 		for (size_t i = 0; i < 64; ++i) {
 			if (vs_args[i] == 0) {
 				vs_args[i] = def_buf_addr;
-				vs_sizes[i] = 0;
+				if (mesh_draw.empty()) vs_sizes[i] = 0;
 			}
 			if (ps_args[i] == 0) {
 				ps_args[i] = def_buf_addr;
@@ -5792,7 +5836,15 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 		MetalDrawExecutor::Instance().SetVertexBuffer(s_vsdbg_buf, 0, 27);
 	}
 	// Vertex stage through the argument encoder (KYTY_ARGENC_GFX=1), with the same per-index check.
-	if (KYTY_ENV("KYTY_ARGENC_GFX") != nullptr && vs_info.stage.program != nullptr) {
+	if (!mesh_draw.empty()) {
+		auto encoder = MetalContext::Instance().GetActiveRenderEncoder();
+		[encoder setMeshBytes:vs_sizes length:sizeof(vs_sizes) atIndex:25];
+		if (ShaderHasArgumentBuffer0(vs_info.stage.program->shader_hash)) {
+			id<MTLFunction> function = MetalShaderManager::Instance().GetFunction(vs_info.stage.program->shader_hash);
+			id<MTLBuffer> args = build_gfx_argbuf(function, s_vs_caps, false);
+			[encoder setMeshBuffer:args offset:0 atIndex:0];
+		}
+	} else if (KYTY_ENV("KYTY_ARGENC_GFX") != nullptr && vs_info.stage.program != nullptr) {
 		id<MTLFunction> vfn = MetalShaderManager::Instance().GetFunction(vs_info.stage.program->shader_hash);
 		if (vfn != nil && ShaderHasArgumentBuffer0(vs_info.stage.program->shader_hash)) {
 			if (KYTY_ENV("KYTY_ARGENC_CHECK") != nullptr) {
@@ -5971,6 +6023,51 @@ static bool DumpRtBeforeDraw(const HW::Context& context, uint64_t ps_hash,
 	return dumped;
 }
 
+static bool SkipMeshForDiagnostics(const HW::Context& context) {
+	static const bool skip_mesh = KYTY_ENV("KYTY_METAL_SKIP_MESH") != nullptr;
+	if (!skip_mesh || (context.GetShaderStages() & 0x20u) == 0) {
+		return false;
+	}
+	static std::atomic_bool reported {false};
+	if (!reported.exchange(true, std::memory_order_relaxed)) {
+		std::fprintf(stderr, "[Metal] Diagnostic mode: skipping unsupported mesh draws\n");
+	}
+	return true;
+}
+
+static uint32_t MeshThreadCount(const ShaderMeshInputInfo& mesh) {
+	const auto logical_threads = mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
+	return ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
+	       std::min(mesh.host_subgroup_size, mesh.wave_size);
+}
+
+static bool DrawMesh(const ShaderVertexInputInfo& front, const ShaderPixelInputInfo& pixel,
+                     bool pixel_active, uint32_t count, uint32_t instance_count, uint32_t first_vertex,
+                     uint32_t first_instance, uint32_t element_size, uint64_t index_guest_address) {
+	const auto& mesh = front.mesh;
+	const auto primitives = mesh.InputPrimitiveCount(count);
+	if (primitives == 0 || instance_count == 0) {
+		return false;
+	}
+	const auto groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
+	const uint32_t draw_data[] {
+	    count, first_vertex, first_instance, element_size,
+	    static_cast<uint32_t>(index_guest_address), static_cast<uint32_t>(index_guest_address >> 32u),
+	};
+	static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
+	BindMetalShaderResources(front, pixel, pixel_active, draw_data);
+	const auto threads = MeshThreadCount(mesh);
+	if (!MetalDrawExecutor::Instance().DrawMesh(groups, instance_count, threads)) {
+		return false;
+	}
+	static std::atomic_bool reported {false};
+	if (!reported.exchange(true, std::memory_order_relaxed)) {
+		std::fprintf(stderr, "[MetalMesh] first draw: groups=%u instances=%u threads=%u indexed=%u\n",
+		             groups, instance_count, threads, element_size != 0);
+	}
+	return true;
+}
+
 void MetalRenderer::DrawIndex(uint64_t submit_id, const HW::Context& context, const HW::Shader& sh_ctx,
                               const HW::UserConfig& ucfg, PipelineCache& pipeline_cache,
                               Prospero::PrimitiveType prim_type,
@@ -5979,6 +6076,9 @@ void MetalRenderer::DrawIndex(uint64_t submit_id, const HW::Context& context, co
                               uint32_t first_instance) {
 	DrawPassTrace draw_pass_trace;
 	const PendingIndirectDraw pending_index = TakePendingIndirectDraw();
+	if (SkipMeshForDiagnostics(context)) {
+		return;
+	}
 	s_trace_submit_id = submit_id;
 	PassTraceNoteDrawState(context, static_cast<uint32_t>(prim_type), index_count);
 	s_trace_instances = instance_count;
@@ -6050,6 +6150,7 @@ void MetalRenderer::DrawIndex(uint64_t submit_id, const HW::Context& context, co
 	    sh_ctx.GetVs(), sh_ctx.GetPs(), context.GetShaderRegisters(),
 	    context, ucfg, target_export_mapping, pixel_active, vertex_info, pixel_info);
 
+	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	uint64_t vs_hash = vertex_info[0].stage.program ? vertex_info[0].stage.program->shader_hash : 0;
 	uint64_t ps_hash = (pixel_active && pixel_info.stage.program) ? pixel_info.stage.program->shader_hash : 0;
 	PrepareGraphicsImages(vertex_info[0].stage);
@@ -6091,10 +6192,11 @@ void MetalRenderer::DrawIndex(uint64_t submit_id, const HW::Context& context, co
 	if (msl_draw_ok) {
 		MetalRenderPipelineKey pipe_key {};
 		pipe_key.primitive_type = static_cast<uint32_t>(prim_type);
+		if (mesh_active) pipe_key.mesh_threads = MeshThreadCount(vertex_info[0].mesh);
 		pipe_key.vs_hash = vs_hash;
 		pipe_key.fs_hash = ps_hash;
 	TracePsRt(context.GetRenderTarget(0).base.addr, ps_hash);
-		ConfigureNativeColorTargets(pipe_key, context);
+		ConfigureNativeColorTargets(pipe_key, context, pixel_info);
 		const auto& rt0 = context.GetRenderTarget(0);
 		const auto& dt = context.GetDepthRenderTarget();
 		if (dt.z_read_base_addr != 0 && dt.z_info.format != Prospero::DepthFormat::kInvalid) {
@@ -6253,8 +6355,16 @@ void MetalRenderer::DrawIndex(uint64_t submit_id, const HW::Context& context, co
 		}
 	}
 
+	if (mesh_active) {
+		if (pending_index.args_addr != 0 || index_addr == nullptr || vertex_info[0].mesh.fast_launch) {
+			EXIT("Metal mesh draw: unsupported indexed draw arguments\n");
+		}
+		const auto element_size = index_type_and_size == 0 ? 2u : 4u;
+		DrawMesh(vertex_info[0], pixel_info, pixel_active, index_count, instance_count,
+		         static_cast<uint32_t>(base_vertex), first_instance, element_size,
+		         reinterpret_cast<uintptr_t>(index_addr));
+	} else {
 	BindMetalShaderResources(vertex_info[0], pixel_info, pixel_active);
-
 	if (s_rect_indexed) {
 		MetalDrawExecutor::Instance().UseResource(rect_ib.buffer, MTLResourceUsageRead);
 		MetalDrawExecutor::Instance().DrawIndexed(prim_type, 6, rect_ib.buffer, rect_ib.offset, MTLIndexTypeUInt32,
@@ -6286,6 +6396,7 @@ void MetalRenderer::DrawIndex(uint64_t submit_id, const HW::Context& context, co
 	    prim_type, index_count,
 	    index_buffer.GetHandle(), 0, idx_type,
 	    instance_count > 0 ? instance_count : 1, base_vertex, first_instance);
+	}
 	{
 		static std::mutex                            s_exec_mutex;
 		static std::unordered_map<uint64_t, uint64_t> s_exec_counts;
@@ -6333,6 +6444,9 @@ void MetalRenderer::DrawAuto(uint64_t submit_id, const HW::Context& context, con
 		}
 	}
 	const PendingIndirectDraw pending_indirect = TakePendingIndirectDraw();
+	if (SkipMeshForDiagnostics(context)) {
+		return;
+	}
 	const uint64_t indirect_args_addr = pending_indirect.args_addr;
 	s_trace_indirect_addr = indirect_args_addr;
 	s_trace_instances = instance_count;
@@ -6385,6 +6499,7 @@ void MetalRenderer::DrawAuto(uint64_t submit_id, const HW::Context& context, con
 	    sh_ctx.GetVs(), sh_ctx.GetPs(), context.GetShaderRegisters(),
 	    context, ucfg, target_export_mapping, pixel_active, vertex_info, pixel_info);
 
+	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	uint64_t vs_hash = vertex_info[0].stage.program ? vertex_info[0].stage.program->shader_hash : 0;
 	uint64_t ps_hash = (pixel_active && pixel_info.stage.program) ? pixel_info.stage.program->shader_hash : 0;
 	PrepareGraphicsImages(vertex_info[0].stage);
@@ -6456,10 +6571,11 @@ void MetalRenderer::DrawAuto(uint64_t submit_id, const HW::Context& context, con
 	if (msl_draw_ok) {
 		MetalRenderPipelineKey pipe_key {};
 		pipe_key.primitive_type = static_cast<uint32_t>(prim_type);
+		if (mesh_active) pipe_key.mesh_threads = MeshThreadCount(vertex_info[0].mesh);
 		pipe_key.vs_hash = vs_hash;
 		pipe_key.fs_hash = ps_hash;
 	TracePsRt(context.GetRenderTarget(0).base.addr, ps_hash);
-		ConfigureNativeColorTargets(pipe_key, context);
+		ConfigureNativeColorTargets(pipe_key, context, pixel_info);
 		const auto& rt0 = context.GetRenderTarget(0);
 		const auto& dt = context.GetDepthRenderTarget();
 		if (dt.z_read_base_addr != 0 && dt.z_info.format != Prospero::DepthFormat::kInvalid) {
@@ -6537,7 +6653,7 @@ void MetalRenderer::DrawAuto(uint64_t submit_id, const HW::Context& context, con
 		}
 	}
 
-	BindMetalShaderResources(vertex_info[0], pixel_info, pixel_active);
+	if (!mesh_active) BindMetalShaderResources(vertex_info[0], pixel_info, pixel_active);
 	{
 		char fault_label[288];
 		std::snprintf(fault_label, sizeof(fault_label), "draw #%llu rt0=0x%llx vs=0x%016llx ps=0x%016llx prim=%u vtx=%u inst=%u tmask=0x%x smask=0x%x blend=%d/%d/%d gfmt=%u mtl=%u",
@@ -6556,7 +6672,13 @@ void MetalRenderer::DrawAuto(uint64_t submit_id, const HW::Context& context, con
 	}
 
 	MslDrawStatExecuted();
-	if (indirect_args_addr != 0) {
+	if (mesh_active) {
+		if (indirect_args_addr != 0) {
+			EXIT("Metal mesh draw: indirect draw arguments are unsupported\n");
+		}
+		DrawMesh(vertex_info[0], pixel_info, pixel_active, vertex_count, std::max(instance_count, 1u),
+		         first_vertex, first_instance, 0, 0);
+	} else if (indirect_args_addr != 0) {
 		if (draw_args != nil) {
 			MetalDrawExecutor::Instance().UseResource(draw_args, MTLResourceUsageRead);
 			for (uint32_t k = 0; k < draw_args_count; ++k) {

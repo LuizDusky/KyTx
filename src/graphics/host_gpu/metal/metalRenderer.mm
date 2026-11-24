@@ -128,7 +128,10 @@ static MetalBufferAllocation SnapshotBytes(const MetalBufferAllocation& src, uin
 
 static bool SnapshotGt7LightingConstants(uint64_t shader_hash, size_t slot, size_t size,
                                          const ShaderRecompiler::IR::BufferResource& resource) {
-	static const bool enabled = KYTY_ENV("KYTY_SNAPSHOT_GT7_LIGHT_CONSTANTS") != nullptr;
+	static const bool enabled = [] {
+		const char* value = KYTY_ENV("KYTY_SNAPSHOT_GT7_LIGHT_CONSTANTS");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
 	// GT7's lighting pass receives 92 dwords of scalar constants in a recycled
 	// guest upload ring. A queued read of dword 72 can see the next upload's data.
 	return enabled && shader_hash == 0x5b8c099adc368053ull && slot == 0 && size == 92 * sizeof(uint32_t) &&
@@ -1033,7 +1036,10 @@ static id<MTLTexture> GpuWrittenArrayFor(const ShaderTextureResource& tex, uint3
 }
 
 static bool StrictCubeBindings() {
-	static const bool enabled = KYTY_ENV("KYTY_METAL_STRICT_CUBES") != nullptr;
+	static const bool enabled = [] {
+		const char* value = KYTY_ENV("KYTY_METAL_STRICT_CUBES");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
 	return enabled;
 }
 

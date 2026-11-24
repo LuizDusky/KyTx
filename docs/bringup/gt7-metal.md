@@ -78,10 +78,13 @@ and the referenced toolchain.
   completed in about 0.5–0.8 ms with the bound at `8`. The failure occurred
   with a six-face texture bound. The PM4 and declared compute-buffer write traces
   did not identify the writer of the changed word.
-- `KYTY_SNAPSHOT_GT7_LIGHT_CONSTANTS=1` preserves the confirmed 368-byte
-  read-only input for this shader in private upload storage for the dispatch.
-  `KYTY_METAL_STRICT_CUBES=1` keeps a one-layer alias from replacing a sampled
-  cubemap. Scene validation for these changes is in progress.
+- The renderer now snapshots this shader's 368-byte read-only buffer into a
+  separate retained upload allocation. Sampled cubemaps use the matching
+  six-face texture or the guest cube layout if the newest writer has one layer.
+  In a World Map run with both changes enabled the traced shader completed
+  364 dispatches, with the bound preserved at `8` and six-face views bound.
+  The scene remains mostly black. Set `KYTY_SNAPSHOT_GT7_LIGHT_CONSTANTS=0`
+  or `KYTY_METAL_STRICT_CUBES=0` to isolate the changes in a diagnostic run.
 - The PS5 reference is a final frame. It identifies the matching shoreline and
   shows which map elements are missing. Comparing intermediate outputs against
   PS5 requires a capture of the same render target on that platform.

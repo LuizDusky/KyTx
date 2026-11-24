@@ -6,26 +6,24 @@ document removes a diagnostic callback specific to that FEX port's original embe
 Keep the KyTx and FEXCore checkouts adjacent as `source` and `fexcore`.
 Install native CMake, Ninja and SPIRV-Cross via Homebrew. Xcode is required.
 
-From the parent directory:
+From the parent directory, if the FEXCore checkout is missing, fetch it once:
 
 ```sh
-git -C source submodule update --init
-git -C fexcore apply --unidiff-zero "$PWD/source/docs/bringup/fexcore-optional-snapshot.patch"
-cmake -S fexcore -B build/fex -G Ninja \
-  -DBUILD_FEXCORE_ONLY=ON -DBUILD_FEXCORE_SMOKE=OFF -DBUILD_TESTING=OFF \
-  -DTUNE_CPU=none -DENABLE_LTO=OFF -DENABLE_JEMALLOC_GLIBC_ALLOC=OFF \
-  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-cmake --build build/fex -j 4
-cmake --build build/fex --target FEXCore FEXCore_Base -j 4
-cmake -S source -B build/kytx -G Ninja \
-  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_BUILD_TYPE=Release \
-  -DKYTY_BUILD_LAUNCHER=OFF -DKYTY_FEX_DIR="$PWD/fexcore" \
-  -DKYTY_FEX_BUILD_DIR="$PWD/build/fex" -DKYTY_FEX_SHIMS_DIR="$PWD/fexcore"
-cmake --build build/kytx --target kyty_emulator -j 4
-file build/kytx/kyty_emulator
-codesign --verify build/kytx/kyty_emulator
+git clone https://github.com/alamshafil/fexcore-darwin.git fexcore
+git -C fexcore checkout --detach eee10cc54a173e79ee16e2169cd4157c7269921b
 ```
+
+Configure and build in the existing `build` directory:
+
+```sh
+bash source/tools/build_prospero_macos.sh build
+```
+
+The script checks the FEXCore revision, applies the compatibility patch once,
+and verifies the arm64 executable signature. Set `CMAKE_BUILD_PARALLEL_LEVEL`
+to change the default of four build jobs. The reference toolchain is Xcode
+27.2 (27B52), CMake 4.5.1 and Ninja 1.13.2. The guide reproduces the source and
+build options. Toolchain or SDK changes can yield different binaries.
 
 From `build/kytx`, run with a legally obtained game directory:
 

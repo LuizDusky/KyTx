@@ -50,6 +50,13 @@ and the referenced toolchain.
   the terrain already black. Its output at `0x9223690000` (color attachment 1)
   is darker still. `a6c1f1e9298a6dcd` then writes that same attachment. The trace
   also shows both passes using the scene depth surface at `0x9210c10000`.
+- With the fixes enabled, the output of `4aa7c29794420db2` shows the terrain and
+  trees before the last composition passes. Its 3D inputs at `0x923dba0000`,
+  `0x923fd60000`, `0x926ef76000` and `0x926f296000` trace back to compute writers
+  `1922aae815846978`, `d2a8505196a1078e` and `e297bb22e6dc4335`. The ordered
+  `[RtVolume]` readback found nonzero packed texels in all four images and
+  zero center texels in the two 240×135×128 images. Their expected PS5 values
+  remain unverified.
 - The dispatch for `ed3ba044f1410a06` writes to a 128×128, six-layer descriptor
   at `0x9296cd0000`, but the old storage allocation was a single 2D texture.
   Several World Map pixel shaders sampled a six-face cube decoded from guest

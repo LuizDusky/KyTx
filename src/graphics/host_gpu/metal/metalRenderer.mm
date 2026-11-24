@@ -6230,19 +6230,27 @@ static bool DumpRtBeforeDraw(const HW::Context& context, uint64_t ps_hash,
 				const uint32_t w = t.Width5()+1u, h = t.Height5()+1u;
 				id<MTLTexture> image = GraphicsImageFor(t,w,h,t.Base40());
 				if (image == nil) continue;
+				const bool packed_float = image.pixelFormat == MTLPixelFormatRG11B10Float;
 				if (image.textureType == MTLTextureType3D && image.storageMode == MTLStorageModeShared &&
-				    image.pixelFormat == MTLPixelFormatRGBA16Float) {
+				    (image.pixelFormat == MTLPixelFormatRGBA16Float || packed_float)) {
 					std::array<uint16_t, 4> voxel {};
-					std::fprintf(stderr, "[RtVolume] slot=%zu addr=%llx %lux%lux%lu tile=%u",
+					const size_t texel_bytes = packed_float ? sizeof(uint32_t) : sizeof(voxel);
+					std::fprintf(stderr, "[RtVolume] slot=%zu addr=%llx %lux%lux%lu tile=%u mtl=%lu",
 					             i, (unsigned long long)t.Base40(), (unsigned long)image.width,
-					             (unsigned long)image.height, (unsigned long)image.depth, (unsigned)t.TileMode());
+					             (unsigned long)image.height, (unsigned long)image.depth, (unsigned)t.TileMode(),
+					             (unsigned long)image.pixelFormat);
 					for (const auto& xyz: std::array<std::array<NSUInteger, 3>, 5> {{
 					    {0, 0, 0}, {image.width - 1, 0, 0}, {0, image.height - 1, 0},
 					    {0, 0, image.depth - 1}, {image.width / 2, image.height / 2, image.depth / 2},
 					}}) {
-						[image getBytes:voxel.data() bytesPerRow:sizeof(voxel) bytesPerImage:sizeof(voxel)
+						[image getBytes:voxel.data() bytesPerRow:texel_bytes bytesPerImage:texel_bytes
 						    fromRegion:MTLRegionMake3D(xyz[0], xyz[1], xyz[2], 1, 1, 1) mipmapLevel:0 slice:0];
-						std::fprintf(stderr, " (%04x,%04x,%04x,%04x)", voxel[0], voxel[1], voxel[2], voxel[3]);
+						if (packed_float) {
+							const uint32_t word = uint32_t(voxel[0]) | (uint32_t(voxel[1]) << 16);
+							std::fprintf(stderr, " %08x", word);
+						} else {
+							std::fprintf(stderr, " (%04x,%04x,%04x,%04x)", voxel[0], voxel[1], voxel[2], voxel[3]);
+						}
 					}
 					std::fputc('\n', stderr);
 				}

@@ -194,11 +194,13 @@ static uint32_t s_rect_idx[3] = {0, 0, 0};  // source vertex ids of an indexed r
 static bool s_rect_indexed = false;
 // Zero-filled stand-in for an image slot whose guest descriptor is empty (a null V# reads as zeros on RDNA). The
 // texture type must match the shader's declaration, so it is keyed by dimension, cube, numeric class and storage.
-static id<MTLTexture> NullImageFor(const ShaderRecompiler::IR::ImageResource& img, bool storage) {
+static id<MTLTexture> NullImageFor(const ShaderRecompiler::IR::ImageResource& img, bool storage,
+                                    bool unit_cube = false) {
 	using Dim = ShaderRecompiler::Decoder::ImageDimension;
 	static std::unordered_map<uint32_t, id<MTLTexture>> s_cache;
 	const uint32_t key = (static_cast<uint32_t>(img.dimension) << 8) | (img.cube ? 0x80u : 0u) |
-	                     (static_cast<uint32_t>(img.numeric_class) << 1) | (storage ? 1u : 0u);
+	                     (static_cast<uint32_t>(img.numeric_class) << 1) | (storage ? 1u : 0u) |
+	                     (unit_cube ? 0x10000u : 0u);
 	if (const auto it = s_cache.find(key); it != s_cache.end()) {
 		return it->second;
 	}
@@ -206,9 +208,9 @@ static id<MTLTexture> NullImageFor(const ShaderRecompiler::IR::ImageResource& im
 	switch (img.dimension) {
 		case Dim::Dim1D: type = MTLTextureType1D; break;
 		case Dim::Dim1DArray: type = MTLTextureType1DArray; break;
-		case Dim::Dim2D: type = img.cube ? MTLTextureTypeCube : MTLTextureType2D; break;
+		case Dim::Dim2D: type = img.cube ? MTLTextureType2DArray : MTLTextureType2D; break;
 		case Dim::Dim3D: type = MTLTextureType3D; break;
-		case Dim::Dim2DArray: type = img.cube ? MTLTextureTypeCubeArray : MTLTextureType2DArray; break;
+		case Dim::Dim2DArray: type = MTLTextureType2DArray; break;
 		default: s_cache[key] = nil; return nil;  // multisampled: no stand-in
 	}
 	MTLPixelFormat fmt = MTLPixelFormatRGBA8Unorm;
@@ -217,13 +219,26 @@ static id<MTLTexture> NullImageFor(const ShaderRecompiler::IR::ImageResource& im
 	MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
 	td.textureType = type;
 	td.pixelFormat = fmt;
-	td.width = 4;
-	td.height = (type == MTLTextureType1D || type == MTLTextureType1DArray) ? 1 : 4;
+	td.width = unit_cube ? 1u : 4u;
+	td.height = (type == MTLTextureType1D || type == MTLTextureType1DArray) ? 1u : td.width;
 	td.depth = type == MTLTextureType3D ? 4 : 1;
-	td.arrayLength = (type == MTLTextureType1DArray || type == MTLTextureType2DArray || type == MTLTextureTypeCubeArray) ? 1 : 1;
-	td.usage = storage ? (MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite) : MTLTextureUsageShaderRead;
+	td.arrayLength = img.cube ? 6u : 1u;
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+	if (storage) td.usage |= MTLTextureUsageShaderWrite;
 	td.storageMode = MTLStorageModeShared;
 	id<MTLTexture> tex = KytyNewTexture(MetalContext::Instance().GetDevice(), td, __LINE__);
+	if (tex != nil) {
+		// A new Metal texture has undefined contents. Initialize every slice,
+		// including the six array slices sampled by the cube lowering.
+		const std::array<uint8_t, 4 * 4 * 4 * 16> zero {};
+		const NSUInteger row_bytes = td.width * BytesPerPixel(fmt);
+		const NSUInteger image_bytes = row_bytes * td.height;
+		const MTLRegion region = MTLRegionMake3D(0, 0, 0, td.width, td.height, td.depth);
+		for (NSUInteger slice = 0; slice < td.arrayLength; ++slice) {
+			[tex replaceRegion:region mipmapLevel:0 slice:slice withBytes:zero.data()
+			       bytesPerRow:row_bytes bytesPerImage:image_bytes];
+		}
+	}
 	s_cache[key] = tex;
 	return tex;
 }
@@ -499,7 +514,7 @@ static id<MTLTexture> MipRangeView(id<MTLTexture> tex, NSUInteger base, NSUInteg
 		return it->second.first;
 	}
 	id<MTLTexture> view = [tex newTextureViewWithPixelFormat:tex.pixelFormat textureType:tex.textureType
-	                                                  levels:NSMakeRange(base, count) slices:NSMakeRange(0, 1)];
+	                                                  levels:NSMakeRange(base, count) slices:NSMakeRange(0, tex.arrayLength)];
 	s_views[key] = {view, ViewCacheNow()};
 	return view;
 }
@@ -513,15 +528,17 @@ struct AliasedImage {
 	uint32_t levels = 1;
 	uint64_t used_flip = 0; // presented frame of the last request (entries unused for kAliasedEvictFlips frames are dropped)
 };
-static std::map<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>, AliasedImage> s_aliased_images;
-static std::map<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>, uint32_t> s_aliased_level_req;
+using AliasedImageKey = std::tuple<uint64_t, uint32_t, uint32_t, MTLPixelFormat, uint32_t>;
+static std::map<AliasedImageKey, AliasedImage> s_aliased_images;
+static std::map<AliasedImageKey, uint32_t> s_aliased_level_req;
 static std::mutex s_aliased_mutex;
 // The key holds the size, and dynamic resolution moves the size of the transient targets every few frames (1600x904, 1624x912,
 // 1640x920, ...): one mipped full-screen texture per size, never freed, passed 20 GB within 90 s of the 3D menu scene. Entries not
 // requested for kAliasedEvictFlips presented frames are dropped (registries that still hold the texture keep it alive meanwhile).
 static constexpr uint64_t kAliasedEvictFlips = 120;
 static uint64_t s_alloc_cs_hash; // hash of the compute kernel being recorded (defined with the allocation probe)
-static id<MTLTexture> AliasedImageFor(uint64_t addr, uint32_t w, uint32_t h, MTLPixelFormat fmt, uint32_t levels_wanted) {
+static id<MTLTexture> AliasedImageFor(uint64_t addr, uint32_t w, uint32_t h, MTLPixelFormat fmt, uint32_t levels_wanted,
+                                      uint32_t array_layers = 0) {
 	std::lock_guard<std::mutex> lock(s_aliased_mutex);
 	const uint64_t now = Libs::Graphics::TraceWindow::g_flip.load(std::memory_order_relaxed);
 	static uint64_t s_aliased_sweep = 0;
@@ -536,7 +553,7 @@ static id<MTLTexture> AliasedImageFor(uint64_t addr, uint32_t w, uint32_t h, MTL
 			}
 		}
 	}
-	const auto key = std::make_tuple(addr, w, h, static_cast<uint32_t>(fmt));
+	const AliasedImageKey key {addr, w, h, fmt, array_layers};
 	uint32_t& req = s_aliased_level_req[key];
 	req = std::max(req, std::max<uint32_t>(levels_wanted, 1u));
 	// A pyramid kernel chain asks for one more level per dispatch (2, 3, ... 11). Growing the texture level by level re-created it
@@ -553,12 +570,16 @@ static id<MTLTexture> AliasedImageFor(uint64_t addr, uint32_t w, uint32_t h, MTL
 	AliasedImage& img = s_aliased_images[key];
 	if (img.tex == nil || img.levels < req) {
 		MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:req > 1];
+		if (array_layers != 0) {
+			d.textureType = MTLTextureType2DArray;
+			d.arrayLength = array_layers;
+		}
 		if (req > 1) d.mipmapLevelCount = std::min<NSUInteger>(req, d.mipmapLevelCount);
 		d.usage = GuestTextureUsage(fmt) | MTLTextureUsageShaderRead;
 		d.storageMode = MTLStorageModeShared;
 		img.tex = KytyNewTexture(MetalContext::Instance().GetDevice(), d, __LINE__);
 		img.levels = req;
-		std::fprintf(stderr, "[AliasImg] addr=0x%llx %ux%u fmt=%lu levels=%u cs=0x%016llx\n", (unsigned long long)addr, w, h, (unsigned long)fmt, req,
+		std::fprintf(stderr, "[AliasImg] addr=0x%llx %ux%u fmt=%lu levels=%u layers=%u cs=0x%016llx\n", (unsigned long long)addr, w, h, (unsigned long)fmt, req, array_layers,
 		             (unsigned long long)s_alloc_cs_hash);
 	}
 	img.used_flip = now;
@@ -635,15 +656,22 @@ static uint64_t GuestTexSourceHash(uint64_t addr, uint64_t bytes);
 static std::mutex s_cs_storage_mutex;
 static std::unordered_map<uint64_t, CsStorageEntry> s_cs_storage;
 static uint64_t s_cs_storage_serial = 0;
+static bool GpuWritableArraysEnabled() {
+	static const bool enabled = KYTY_ENV("KYTY_METAL_GPU_ARRAYS") != nullptr;
+	return enabled;
+}
 // Last GPU writer of a guest address (compute storage image or render target): the surface converter uses it as the source of
 // truth when a later pass reads the same memory with another format, size or tile layout.
 static void TraceRangeOp(const char* op, uint64_t addr, uint64_t bytes);
 // hash_guest (compute storage bindings, not the per-draw render-target calls): also hash the guest bytes behind the image, so a reader
 // many frames later can tell whether the CPU has replaced them since (AliasConvert).
 static void RecordComputeStorage(uint64_t addr, id<MTLTexture> tex, Prospero::TileMode tile = Prospero::TileMode::kLinear, bool hash_guest = false) {
-	if (addr == 0 || tex == nil || tex.textureType != MTLTextureType2D) return;
-	TraceRangeOp("storage_write", addr, static_cast<uint64_t>(tex.width) * tex.height * 4);
-	const uint64_t bytes = hash_guest && !IsCompressedFormat(tex.pixelFormat) ? static_cast<uint64_t>(tex.width) * tex.height * BytesPerPixel(tex.pixelFormat) : 0;
+	if (addr == 0 || tex == nil || (tex.textureType != MTLTextureType2D &&
+	    (tex.textureType != MTLTextureType2DArray || !GpuWritableArraysEnabled()))) return;
+	const uint64_t texels = static_cast<uint64_t>(tex.width) * tex.height * tex.arrayLength;
+	TraceRangeOp("storage_write", addr, texels * 4);
+	const uint64_t bytes = hash_guest && tex.textureType == MTLTextureType2D && !IsCompressedFormat(tex.pixelFormat) ?
+	    texels * BytesPerPixel(tex.pixelFormat) : 0;
 	const uint64_t hash = bytes != 0 ? GuestTexSourceHash(addr, bytes) : 0;
 	std::lock_guard<std::mutex> lock(s_cs_storage_mutex);
 	CsStorageEntry& e = s_cs_storage[addr];
@@ -743,6 +771,14 @@ static bool IsDepthStencilPixelFormat(MTLPixelFormat f) {
 		case MTLPixelFormatX32_Stencil8: return true;
 		default: return false;
 	}
+}
+
+// Depth/stencil storage has an extra stencil plane on Metal. Float reads
+// still address its depth component through a sampled 2D texture.
+static bool CanSampleDepthAsFloat(MTLPixelFormat depth, MTLPixelFormat target) {
+	return (depth == MTLPixelFormatDepth16Unorm && target == MTLPixelFormatR16Unorm) ||
+	       ((depth == MTLPixelFormatDepth32Float || depth == MTLPixelFormatDepth32Float_Stencil8) &&
+	        target == MTLPixelFormatR32Float);
 }
 
 // The registry remembers the last texture bound at an address, whatever its format. A registered texture of another texel size is
@@ -949,7 +985,44 @@ static id<MTLTexture> AliasConvert(uint64_t addr, uint32_t w, uint32_t h, Prospe
 // Last render pass begun by EnsureActiveRenderPass: reused to reopen the pass around a multi-draw clamp, and read by image binding.
 static MetalRenderPassDesc s_last_pass_desc;
 static bool s_last_pass_valid = false;
+// A 1x1 sampled cubemap with constant component selectors has no texel
+// dependency. Games use such descriptors to disable a material contribution.
+static bool IsConstantUnitCube(const ShaderTextureResource& tex) {
+	return tex.Type() == Prospero::ImageType::kCube && tex.Width5() == 0u &&
+	       tex.Height5() == 0u && tex.BaseLevel() == 0u && tex.LastLevel() == 0u &&
+	       tex.DstSelX() <= 1u && tex.DstSelY() <= 1u && tex.DstSelZ() <= 1u && tex.DstSelW() <= 1u;
+}
+
+static id<MTLTexture> ConstantComputeCube(const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                            uint32_t slot, const ShaderTextureResource& tex) {
+	if (!program.native_msl || slot >= program.info.images.size()) return nil;
+	const auto& image = program.info.images[slot];
+	if (!image.cube || image.resource_class != ShaderRecompiler::IR::ImageResourceClass::Sampled ||
+	    !IsConstantUnitCube(tex)) return nil;
+	return ApplyDstSel(NullImageFor(image, false, true), tex);
+}
+
+static id<MTLTexture> GpuWrittenArrayFor(const ShaderTextureResource& tex, uint32_t w, uint32_t h) {
+	if ((tex.Type() != Prospero::ImageType::kCube && tex.Type() != Prospero::ImageType::kColor2DArray) ||
+	    tex.BaseArray5() != 0 || tex.BaseLevel() > tex.LastLevel()) return nil;
+	std::lock_guard<std::mutex> lock(s_cs_storage_mutex);
+	const auto it = s_cs_storage.find(tex.Base40());
+	if (it == s_cs_storage.end() || it->second.tile != tex.TileMode()) return nil;
+	id<MTLTexture> writer = it->second.tex;
+	if (writer.textureType != MTLTextureType2DArray || writer.width != w || writer.height != h ||
+	    writer.arrayLength != uint32_t(tex.Depth()) + 1u || writer.mipmapLevelCount <= tex.LastLevel() ||
+	    writer.pixelFormat != MetalFormatFromBufferFormat(tex.Format())) return nil;
+	return writer;
+}
+
 static id<MTLTexture> GraphicsImageFor(const ShaderTextureResource& tex, uint32_t w, uint32_t h, uint64_t addr) {
+	if (id<MTLTexture> array = GpuWrittenArrayFor(tex, w, h)) {
+		const NSUInteger count = uint32_t(tex.LastLevel()) + 1u - tex.BaseLevel();
+		if (tex.BaseLevel() != 0 || count != array.mipmapLevelCount) {
+			return MipRangeView(array, tex.BaseLevel(), count);
+		}
+		return array;
+	}
 	// GPU-produced plain 2D images are read from the same guest-memory views the writers used (see GpuSurfaceFor). A depth surface or a mipped
 	// image the GPU wrote has no guest-memory form: the lookups below handle those.
 	if (UmaSurfacesEnabled() && tex.Type() == Prospero::ImageType::kColor2D && tex.BaseLevel() == 0 && tex.LastLevel() == 0) {
@@ -992,13 +1065,15 @@ static id<MTLTexture> GraphicsImageFor(const ShaderTextureResource& tex, uint32_
 		uint64_t wr_flip = 0;
 		if (id<MTLTexture> last = LastGpuWriterTexture(addr, &wr_flip)) {
 			const uint64_t now_flip = Libs::Graphics::TraceWindow::g_flip.load(std::memory_order_relaxed);
-			const bool depth_writer = last.pixelFormat == MTLPixelFormatDepth32Float || last.pixelFormat == MTLPixelFormatDepth16Unorm;
+			const bool depth_writer = IsDepthFormat(last.pixelFormat);
 			const bool in_current_pass = s_last_pass_valid && s_last_pass_desc.has_depth && s_last_pass_desc.depth_attachment.texture == last;
 			if (last.width == w && last.height == h && last.mipmapLevelCount == 1 && last.textureType == MTLTextureType2D && !in_current_pass) {
 				const MTLPixelFormat want_fmt = MetalFormatFromBufferFormat(tex.Format());
 				if (depth_writer) {
 					const uint32_t web = last.pixelFormat == MTLPixelFormatDepth16Unorm ? 2u : 4u;
-					if (now_flip <= wr_flip + 2 && want_fmt != MTLPixelFormatInvalid && !IsCompressedFormat(want_fmt) && BytesPerPixel(want_fmt) == web) {
+					if (now_flip <= wr_flip + 2 && (CanSampleDepthAsFloat(last.pixelFormat, want_fmt) ||
+					    (last.pixelFormat != MTLPixelFormatDepth32Float_Stencil8 && want_fmt != MTLPixelFormatInvalid &&
+					     !IsCompressedFormat(want_fmt) && BytesPerPixel(want_fmt) == web))) {
 						return last;
 					}
 				} else if (SameTexelSize(last, want_fmt)) {
@@ -1143,7 +1218,8 @@ static id<MTLTexture> AliasConvert(uint64_t addr, uint32_t w, uint32_t h, Prospe
 	// 39x18 RGBA32Uint image and sampled for minutes: decoded from guest memory it shows block-shaped letters filled with noise, from
 	// the old writer it is black (the copy's 64x64 staging source was all zeros when the dispatch was encoded) - neither is right.
 	const uint64_t now_flip = Libs::Graphics::TraceWindow::g_flip.load(std::memory_order_relaxed);
-	if (wr.tex == nil || wr.tile == Prospero::TileMode::kLinear || wr.tex.mipmapLevelCount != 1) return nil;
+	if (wr.tex == nil || wr.tex.textureType != MTLTextureType2D || wr.tile == Prospero::TileMode::kLinear ||
+	    wr.tex.mipmapLevelCount != 1) return nil;
 	if (now_flip > wr.flip + 2) {
 		static const bool s_old = KYTY_ENV("KYTY_ALIAS_OLD_WRITER") != nullptr;
 		if (!s_old || wr.guest_hash == 0) return nil;
@@ -5264,7 +5340,13 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 						             (unsigned long long)Libs::Graphics::TraceWindow::g_flip.load());
 					}
 				}
-				id<MTLTexture> base_image = GraphicsImageFor(tex, w, h, addr);
+				const auto* image = stage.program && i < stage.program->info.images.size() ?
+				    &stage.program->info.images[i] : nullptr;
+				const bool constant_cube = image && image->cube &&
+				    image->resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
+				    IsConstantUnitCube(tex);
+				id<MTLTexture> base_image = constant_cube ? NullImageFor(*image, false, true) :
+				    GraphicsImageFor(tex, w, h, addr);
 				// KYTY_LOG_TEX_UNIQ=<lo>,<hi>: every distinct sampled image in that flip range, with the non-zero ratio of the
 				// bound Metal object (finds images the game samples that nobody filled).
 				if (const char* uq = KYTY_ENV("KYTY_LOG_TEX_UNIQ"); uq != nullptr && base_image != nil) {
@@ -5346,6 +5428,21 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 					    std::find(binding.resources.begin(), binding.resources.end(), i) != binding.resources.end()) storage_image = true;
 				}
 				if (id<MTLTexture> texture = storage_image ? base_image : ApplyDstSel(base_image, tex)) {
+					static const char* watch = KYTY_ENV("KYTY_LOG_BOUND_IMAGE");
+					if (watch && args == ps_args && stage.program && addr == std::strtoull(watch, nullptr, 16)) {
+						const uint64_t flip = Libs::Graphics::TraceWindow::g_flip.load();
+						static const uint64_t first = KYTY_ENV("KYTY_DUMP_RT_MIN_FLIP") ?
+						    std::strtoull(KYTY_ENV("KYTY_DUMP_RT_MIN_FLIP"), nullptr, 10) : 0;
+						if (flip >= first && flip - first < 4) {
+							const auto swizzle = texture.swizzle;
+							std::fprintf(stderr, "[BoundPS] hash=%016llx slot=%zu addr=%llx fmt=%u tile=%u target=%lu mtl=%lu dim=%lux%lux%lu guest=%03x host=%u,%u,%u,%u\n",
+							             (unsigned long long)stage.program->shader_hash, i, (unsigned long long)addr,
+							             (unsigned)tex.Format(), (unsigned)tex.TileMode(), (unsigned long)texture.textureType,
+							             (unsigned long)texture.pixelFormat, (unsigned long)texture.width, (unsigned long)texture.height,
+							             (unsigned long)texture.depth, tex.DstSelXYZW(), (unsigned)swizzle.red, (unsigned)swizzle.green,
+							             (unsigned)swizzle.blue, (unsigned)swizzle.alpha);
+						}
+					}
 					args[64 + i] = [texture gpuResourceID]._impl;
 					(args == ps_args ? s_ps_caps : s_vs_caps).push_back({static_cast<uint32_t>(64 + i), nil, 0, texture, nil});
 					if (args == ps_args && PassTraceActive() && s_trace_draw_inputs.size() < 64) s_trace_draw_inputs.push_back({texture, static_cast<uint32_t>(64 + i), addr, w, h, static_cast<uint32_t>(tex.Format()), static_cast<uint32_t>(tex.TileMode())});
@@ -5353,15 +5450,25 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 					if (storage_image) RecordComputeStorage(addr, base_image, tex.TileMode(), true);
 					// Presenter lookup by guest address (the flip buffer is bound as an image by its writer). The image
 					// itself, not its DST_SEL view: compute later binds the registered object as a writable storage image.
-					RegisterComputeWrittenImage(addr, (__bridge void*)base_image);
+					if (!constant_cube && (base_image.textureType != MTLTextureType2DArray || !GpuWritableArraysEnabled())) {
+						RegisterComputeWrittenImage(addr, (__bridge void*)base_image);
+					}
 				}
 			}
 		}
 		for (uint32_t i = 0; i < 64; ++i) {
 			if (args[64 + i] == 0) {
-				// A declared image slot nobody bound is replaced by the white default texture: report it once per shader slot.
+				// Use a compatible zero image for declared slots with no texture.
 				if (stage.program != nullptr && i < stage.program->info.images.size()) {
-					NoteFallback("unbound image slot (white default texture)", static_cast<uint32_t>(stage.program->shader_hash),
+					const auto& image = stage.program->info.images[i];
+					if (image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+						if (auto zero = NullImageFor(image, false)) {
+							args[64 + i] = [zero gpuResourceID]._impl;
+							(args == ps_args ? s_ps_caps : s_vs_caps).push_back({64u + i, nil, 0, zero, nil});
+							MetalDrawExecutor::Instance().UseResource(zero, MTLResourceUsageRead);
+						}
+					}
+					NoteFallback("unbound image slot", static_cast<uint32_t>(stage.program->shader_hash),
 					             static_cast<uint32_t>(stage.program->shader_hash >> 32), i);
 					// KYTY_LOG_UNBOUND=1: what the guest descriptor of such a slot holds (null T#, an unsupported type or format, or an
 					// address with nothing behind it), once per shader slot.
@@ -5373,7 +5480,6 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 						ShaderTextureResource tex {};
 						const bool has_desc = stage.resources != nullptr && i < stage.resources->images.size();
 						if (has_desc) std::copy_n(stage.resources->images[i].dwords.begin(), 8, tex.fields);
-						const auto& image = stage.program->info.images[i];
 						if (s_ub_seen.emplace(stage.program->shader_hash, i, has_desc, tex.IsNull()).second) {
 							std::fprintf(stderr, "[Unbound] %c hash=%016llx guest=%016llx slot=%u source=%u pc=0x%x desc=%d null=%d dim=%d addr=0x%llx %ux%u fmt=%u type=%u tile=%u lvls=%u-%u dst_sel=%u%u%u%u d=%08x %08x %08x %08x\n",
 							             args == ps_args ? 'P' : 'V', (unsigned long long)stage.program->shader_hash, (unsigned long long)stage.program->guest_hash, i, image.source, image.first_use_pc, has_desc ? 1 : 0,
@@ -5385,7 +5491,7 @@ static void BindMetalShaderResources(const ShaderVertexInputInfo& vs_info,
 						}
 					}
 				}
-				args[64 + i] = def_tex_id;
+				if (args[64 + i] == 0) args[64 + i] = def_tex_id;
 			}
 		}
 		for (uint32_t i = 0; i < 32; ++i) {
@@ -5977,8 +6083,14 @@ static bool DumpRtBeforeDraw(const HW::Context& context, uint64_t ps_hash,
 	static bool started = false;
 	static uint32_t count = 0;
 	static uint64_t flip0 = 0;
-	const auto& rt = context.GetRenderTarget(0);
-	if (rt.base.addr != want_addr) return false;
+	if (want_addr == 0) return false;
+	const auto mask = context.GetRenderTargetMask();
+	unsigned slot = 0;
+	for (; slot < RENDER_COLOR_ATTACHMENTS_MAX; ++slot) {
+		if (((mask >> (4u * slot)) & 0xfu) != 0 && context.GetRenderTarget(slot).base.addr == want_addr) break;
+	}
+	if (slot == RENDER_COLOR_ATTACHMENTS_MAX) return false;
+	const auto& rt = context.GetRenderTarget(slot);
 	const auto fmt = MetalFormatFromRenderTarget(rt.info.format, rt.info.channel_type, rt.info.channel_order);
 	if (const char* filter = KYTY_ENV("KYTY_DUMP_RT_FORMAT");
 	    filter && (uint32_t)fmt != std::strtoul(filter, nullptr, 10)) return false;
@@ -6001,30 +6113,90 @@ static bool DumpRtBeforeDraw(const HW::Context& context, uint64_t ps_hash,
 		if (!dir) dir = "/tmp/fix6";
 		std::snprintf(path, sizeof(path), "%s/rt_%u.ppm", dir, k);
 		if (texture) MetalPresenter::Instance().DumpTextureToPpm(texture, path);
-		const auto& bc = context.GetBlendControl(0);
-		std::fprintf(stderr, "[RtDraw] k=%u flip=%llu ps=%016llx fmt=%u mask=%x/%x blend=%d/%u/%u -> %s\n", k,
-		             (unsigned long long)flip0, (unsigned long long)ps_hash, (unsigned)fmt,
-		             context.GetRenderTargetMask(), context.GetShaderRegisters().m_cbShaderMask,
+		const auto& bc = context.GetBlendControl(slot);
+		std::fprintf(stderr, "[RtDraw] k=%u flip=%llu ps=%016llx slot=%u fmt=%u mask=%x/%x blend=%d/%u/%u -> %s\n", k,
+		             (unsigned long long)flip0, (unsigned long long)ps_hash, slot, (unsigned)fmt,
+		             mask, context.GetShaderRegisters().m_cbShaderMask,
 		             bc.enable ? 1 : 0, (unsigned)bc.color_srcblend, (unsigned)bc.color_destblend, path);
 		if (k == 0 && pixel_info.stage.resources) {
 			const auto& snap = *pixel_info.stage.resources;
+			if (!snap.buffers.empty()) {
+				const auto& desc = snap.buffers.front().dwords;
+				const uint64_t address = (static_cast<uint64_t>(desc[1] & 0xffffu) << 32u) | desc[0];
+				std::array<uint32_t, 64> words {};
+				const size_t bytes = std::min<size_t>(sizeof(words), VsharpBytes(desc));
+				if (address != 0 && bytes != 0 && LibKernel::Memory::TryReadBacking(address, words.data(), bytes)) {
+					std::fprintf(stderr, "[RtConstants] addr=%llx bytes=%zu words:", (unsigned long long)address, bytes);
+					for (size_t i = 0; i < bytes / sizeof(uint32_t); ++i) std::fprintf(stderr, " %08x", words[i]);
+					std::fputc('\n', stderr);
+				}
+			}
 			for (size_t i = 0; i < snap.images.size(); ++i) {
 				ShaderTextureResource t {};
 				std::copy_n(snap.images[i].dwords.begin(), 8, t.fields);
 				const uint32_t w = t.Width5()+1u, h = t.Height5()+1u;
 				id<MTLTexture> image = GraphicsImageFor(t,w,h,t.Base40());
-				if (image == nil || image.textureType != MTLTextureType2D) continue;
+				if (image == nil) continue;
+				if (image.textureType == MTLTextureType3D && image.storageMode == MTLStorageModeShared &&
+				    image.pixelFormat == MTLPixelFormatRGBA16Float) {
+					std::array<uint16_t, 4> voxel {};
+					std::fprintf(stderr, "[RtVolume] slot=%zu addr=%llx %lux%lux%lu tile=%u",
+					             i, (unsigned long long)t.Base40(), (unsigned long)image.width,
+					             (unsigned long)image.height, (unsigned long)image.depth, (unsigned)t.TileMode());
+					for (const auto& xyz: std::array<std::array<NSUInteger, 3>, 5> {{
+					    {0, 0, 0}, {image.width - 1, 0, 0}, {0, image.height - 1, 0},
+					    {0, 0, image.depth - 1}, {image.width / 2, image.height / 2, image.depth / 2},
+					}}) {
+						[image getBytes:voxel.data() bytesPerRow:sizeof(voxel) bytesPerImage:sizeof(voxel)
+						    fromRegion:MTLRegionMake3D(xyz[0], xyz[1], xyz[2], 1, 1, 1) mipmapLevel:0 slice:0];
+						std::fprintf(stderr, " (%04x,%04x,%04x,%04x)", voxel[0], voxel[1], voxel[2], voxel[3]);
+					}
+					std::fputc('\n', stderr);
+				}
+				if (image.textureType != MTLTextureType2D) continue;
 				MetalRenderer::Instance().WaitIdle();
 				std::snprintf(path,sizeof(path),"%s/input_%zu.ppm",dir,i);
 				MetalPresenter::Instance().DumpTextureToPpm((__bridge void*)image,path);
-				std::fprintf(stderr,"[RtInput] slot=%zu addr=%llx %ux%u fmt=%u tile=%u mtl=%lu -> %s\n",i,
+				std::fprintf(stderr,"[RtInput] slot=%zu addr=%llx %ux%u fmt=%u tile=%u mtl=%lu swz=%03x -> %s\n",i,
 				             (unsigned long long)t.Base40(),w,h,(unsigned)t.Format(),(unsigned)t.TileMode(),
-				             (unsigned long)image.pixelFormat,path);
+				             (unsigned long)image.pixelFormat,t.DstSelXYZW(),path);
 			}
 		}
 		dumped = true;
 	}
 	return dumped;
+}
+
+// Trace all render-target slots. Some lighting passes put the HDR image in
+// MRT1 while color target 0 is disabled.
+static void TraceImageProducer(const HW::Context& context, uint64_t shader_hash,
+                               const ShaderPixelInputInfo& pixel) {
+	static const char* address = KYTY_ENV("KYTY_LOG_IMAGE_PRODUCER");
+	if (address == nullptr || shader_hash == 0) return;
+	static const uint64_t target = std::strtoull(address, nullptr, 16);
+	if (target == 0) return;
+	const uint64_t flip = Libs::Graphics::TraceWindow::g_flip.load();
+	static const uint64_t first = KYTY_ENV("KYTY_DUMP_RT_MIN_FLIP") ?
+	    std::strtoull(KYTY_ENV("KYTY_DUMP_RT_MIN_FLIP"), nullptr, 10) : 0;
+	if (flip < first || flip - first >= 12) return;
+	const auto mask = context.GetRenderTargetMask();
+	for (unsigned slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; ++slot) {
+		if (((mask >> (4u * slot)) & 0xfu) == 0 || context.GetRenderTarget(slot).base.addr != target) continue;
+		const auto& output = context.GetRenderTarget(slot);
+		std::fprintf(stderr, "[ImageProducer] flip=%llu ps=%016llx addr=%llx slot=%u fmt=%u mask=%x/%x",
+		             (unsigned long long)flip, (unsigned long long)shader_hash, (unsigned long long)target,
+		             slot, (unsigned)output.info.format, mask,
+		             context.GetShaderRegisters().m_cbShaderMask);
+		if (pixel.stage.resources) {
+			for (const auto& image: pixel.stage.resources->images) {
+				ShaderTextureResource desc {};
+				std::copy_n(image.dwords.begin(), 8, desc.fields);
+				std::fprintf(stderr, " R@%llx(%ux%u:%u swz=%03x)", (unsigned long long)desc.Base40(),
+				             desc.Width5() + 1u, desc.Height5() + 1u, (unsigned)desc.Format(), desc.DstSelXYZW());
+			}
+		}
+		std::fputc('\n', stderr);
+	}
 }
 
 static bool SkipMeshForDiagnostics(const HW::Context& context) {
@@ -6159,6 +6331,7 @@ void MetalRenderer::DrawIndex(uint64_t submit_id, const HW::Context& context, co
 	uint64_t ps_hash = (pixel_active && pixel_info.stage.program) ? pixel_info.stage.program->shader_hash : 0;
 	PrepareGraphicsImages(vertex_info[0].stage);
 	if (pixel_active) PrepareGraphicsImages(pixel_info.stage);
+	TraceImageProducer(context, ps_hash, pixel_info);
 	if (DumpRtBeforeDraw(context, ps_hash, pixel_info)) EnsureActiveRenderPass(context);
 
 	id<MTLFunction> vs_func = MetalShaderManager::Instance().GetFunction(vs_hash);
@@ -6508,7 +6681,29 @@ void MetalRenderer::DrawAuto(uint64_t submit_id, const HW::Context& context, con
 	uint64_t ps_hash = (pixel_active && pixel_info.stage.program) ? pixel_info.stage.program->shader_hash : 0;
 	PrepareGraphicsImages(vertex_info[0].stage);
 	if (pixel_active) PrepareGraphicsImages(pixel_info.stage);
+	TraceImageProducer(context, ps_hash, pixel_info);
 	if (DumpRtBeforeDraw(context, ps_hash, pixel_info)) EnsureActiveRenderPass(context);
+
+	if (const char* range = KYTY_ENV("KYTY_LOG_DRAWS_FLIP")) {
+		unsigned first = 0, last = 0;
+		const auto flip = TraceWindow::g_flip.load();
+		if (std::sscanf(range, "%u,%u", &first, &last) == 2 && flip >= first && flip <= last) {
+			const auto& target = context.GetRenderTarget(0);
+			std::fprintf(stderr, "[AutoF] flip=%llu rt0=0x%llx vs=%016llx ps=%016llx prim=%u count=%u mesh=%d fmt=%u",
+			             (unsigned long long)flip, (unsigned long long)target.base.addr, (unsigned long long)vs_hash,
+			             (unsigned long long)ps_hash, (unsigned)prim_type, vertex_count, mesh_active ? 1 : 0,
+			             (unsigned)target.info.format);
+			if (pixel_info.stage.resources) {
+				for (const auto& image: pixel_info.stage.resources->images) {
+					ShaderTextureResource desc {};
+					std::copy_n(image.dwords.begin(), 8, desc.fields);
+					std::fprintf(stderr, " R@%llx(%ux%u:%u)", (unsigned long long)desc.Base40(),
+					             desc.Width5() + 1u, desc.Height5() + 1u, (unsigned)desc.Format());
+				}
+			}
+			std::fputc('\n', stderr);
+		}
+	}
 
 	id<MTLFunction> vs_func = MetalShaderManager::Instance().GetFunction(vs_hash);
 	id<MTLFunction> ps_func = ps_hash ? MetalShaderManager::Instance().GetFunction(ps_hash) : nil;
@@ -7388,6 +7583,11 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					for (size_t f = 0; f < 8; ++f) {
 						tex.fields[f] = desc.dwords[f];
 					}
+					if (id<MTLTexture> cube = ConstantComputeCube(cprog, res, tex)) {
+						if (64u + res < std::size(arg_ptrs)) arg_ptrs[64u + res] = [cube gpuResourceID]._impl;
+						cs_residency.push_back(cube);
+						continue;
+					}
 					const uint64_t addr = tex.Base40();
 					const uint32_t w = static_cast<uint32_t>(tex.Width5()) + 1u;
 					const uint32_t h = static_cast<uint32_t>(tex.Height5()) + 1u;
@@ -7397,6 +7597,25 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					// memory, which would read back as zeros.
 					id<MTLTexture> texture = nil;
 					const char* via = "";
+					const bool declared_array = res < cprog.info.images.size() &&
+					    cprog.info.images[res].dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+					const bool cube = res < cprog.info.images.size() && cprog.info.images[res].cube;
+					const bool gpu_arrays = GpuWritableArraysEnabled();
+					if (gpu_arrays && declared_array && storage && tex.Type() == Prospero::ImageType::kColor2DArray &&
+					    tex.BaseArray5() == 0 && tex.BaseLevel() <= tex.LastLevel()) {
+						const auto fmt = MetalFormatFromBufferFormat(tex.Format());
+						const uint32_t layers = uint32_t(tex.Depth()) + 1u;
+						const uint32_t levels = std::max(tex.LastLevel(), tex.MaxMip()) + 1u;
+						if ((GuestTextureUsage(fmt) & MTLTextureUsageShaderWrite) != 0 && layers <= 2048 &&
+						    levels <= std::bit_width(std::max(w, h)) &&
+						    uint64_t(w) * h * layers * BytesPerPixel(fmt) <= (128ull << 20)) {
+							texture = AliasedImageFor(addr, w, h, fmt, levels, layers);
+							via = "array-storage";
+						}
+					} else if (!storage && (declared_array || cube)) {
+						texture = GpuWrittenArrayFor(tex, w, h);
+						if (texture != nil) via = "array-writer";
+					}
 					{
 						// GPU-produced images are views over the guest memory (see GpuSurfaceFor): writes and later reads meet in the same bytes.
 						// Opt-in until validated (KYTY_UMA_SURFACES=1): with it on, producer/consumer pairs of GPU-produced images meet in the same
@@ -7441,7 +7660,7 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 						                      cprog.info.images[res].dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
 						                      tex.Type() != Prospero::ImageType::kCube && tex.Type() != Prospero::ImageType::kColor3D &&
 						                      tex.BaseLevel() == 0 && tex.LastLevel() == 0;
-						if (!s_uma_off && uma_allowed && plain_2d && uma_fmt != MTLPixelFormatInvalid && !IsCompressedFormat(uma_fmt) &&
+						if (texture == nil && !s_uma_off && uma_allowed && plain_2d && uma_fmt != MTLPixelFormatInvalid && !IsCompressedFormat(uma_fmt) &&
 						    (!storage || (GuestTextureUsage(uma_fmt) & MTLTextureUsageShaderWrite) != 0)) {
 							bool special_writer = false;
 							if (!storage) {
@@ -7463,8 +7682,8 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 						if (id<MTLTexture> last = LastGpuWriterTexture(addr)) {
 							const MTLPixelFormat want_fmt = MetalFormatFromBufferFormat(tex.Format());
 							if (last.width == w && last.height == h && last.mipmapLevelCount == 1 && last.textureType == MTLTextureType2D &&
-							    SameTexelSize(last, want_fmt)) {
-								texture = ReinterpretFormat(last, want_fmt);
+							    (CanSampleDepthAsFloat(last.pixelFormat, want_fmt) || SameTexelSize(last, want_fmt))) {
+								texture = CanSampleDepthAsFloat(last.pixelFormat, want_fmt) ? last : ReinterpretFormat(last, want_fmt);
 								via = "lastwriter";
 							}
 						}
@@ -7714,7 +7933,8 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					}
 					if (!texture) continue;
 					const auto declared_format = MetalFormatFromBufferFormat(tex.Format());
-					if (declared_format != MTLPixelFormatInvalid && texture.pixelFormat != declared_format) {
+					if (declared_format != MTLPixelFormatInvalid && texture.pixelFormat != declared_format &&
+					    (storage || !CanSampleDepthAsFloat(texture.pixelFormat, declared_format))) {
 						// The surface was found under another format of the same texel size (a kernel packs RG11B10 by hand into an R32Uint
 						// image, another reads the same bytes as RG11B10): bind a view of the declared format over the same bytes. Bound
 						// as it was, an RG11B10 image read through an R32Uint texture (and back) returned garbage.
@@ -7735,7 +7955,9 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					}
 					// T# base/last level: bind a view of that level range (the surface keeps one base address for all levels).
 					bool mip_view_bound = false;
-					if (texture.textureType == MTLTextureType2D && (tex.BaseLevel() > 0 || tex.LastLevel() > 0)) {
+					const bool array_texture = gpu_arrays && texture.textureType == MTLTextureType2DArray;
+					if ((texture.textureType == MTLTextureType2D || array_texture) &&
+					    (tex.BaseLevel() > 0 || tex.LastLevel() > 0)) {
 						RequestRtMips(addr, static_cast<uint32_t>(tex.LastLevel()) + 1u);
 						const NSUInteger avail_levels = texture.mipmapLevelCount;
 						if (avail_levels > 1 && tex.BaseLevel() < avail_levels) {
@@ -7745,7 +7967,7 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 							    avail_levels - base_l);
 							cs_residency.push_back(texture);
 							id<MTLTexture> full_tex = texture;
-							texture = MipRangeView(texture, base_l, cnt_l);
+							if (base_l != 0 || cnt_l != avail_levels) texture = MipRangeView(texture, base_l, cnt_l);
 							PassTraceRebind(full_tex, texture, storage);
 							mip_view_bound = true;
 						}
@@ -7754,7 +7976,7 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 						std::fprintf(stderr, "[CsMip] flip=%llu cs=0x%016llx res=%u %s addr=0x%llx T# levels=%u..%u texture=%lux%lu levels=%lu bound_view=%d\n", static_cast<unsigned long long>(Libs::Graphics::TraceWindow::g_flip.load()),
 						             static_cast<unsigned long long>(cprog.shader_hash), (unsigned)res, storage ? "STORE" : "load ", static_cast<unsigned long long>(addr),
 						             (unsigned)tex.BaseLevel(), (unsigned)tex.LastLevel(), (unsigned long)texture.width, (unsigned long)texture.height, (unsigned long)texture.mipmapLevelCount, mip_view_bound ? 1 : 0);
-					if (!mip_view_bound && ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) == ShaderRecompiler::IR::ImageResourceClass::Storage) {
+					if (!array_texture && !mip_view_bound && storage) {
 						RegisterComputeWrittenImage(addr, (__bridge void*)texture);
 					}
 					{
@@ -7780,10 +8002,8 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 					const uint32_t slot = cprog.native_msl
 					    ? 64u + res
 					    : ShaderRecompiler::IR::NativeBinding(cprog.stage, binding.kind) + static_cast<uint32_t>(r);
-					const bool declared_array = res < cprog.info.images.size() &&
-					    (cprog.info.images[res].dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray);
 					texture = ConformToDeclaredArray(texture, declared_array);
-					id<MTLTexture> bound_tex = (!storage && !mip_view_bound) ? ApplyDstSel(texture, tex) : texture;
+					id<MTLTexture> bound_tex = (!storage && (!mip_view_bound || array_texture)) ? ApplyDstSel(texture, tex) : texture;
 					if (slot < 256) {
 						arg_ptrs[slot] = [bound_tex gpuResourceID]._impl;
 					}
@@ -8036,7 +8256,9 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 							for (size_t f = 0; f < 8; ++f) tx.fields[f] = d.dwords[f];
 							const uint32_t w = static_cast<uint32_t>(tx.Width5()) + 1u;
 							const uint32_t h = static_cast<uint32_t>(tx.Height5()) + 1u;
-							id<MTLTexture> tt = ComputeGuestImageFor(*compute_info.stage.program, res, tx, w, h, tx.Base40());
+							const auto& cprog = *compute_info.stage.program;
+							id<MTLTexture> tt = ConstantComputeCube(cprog, res, tx);
+							if (tt == nil) tt = ComputeGuestImageFor(cprog, res, tx, w, h, tx.Base40());
 							if (tt == nil && KYTY_ENV("KYTY_MTL_FAULT_INFO") != nullptr) {
 								std::fprintf(stderr, "[CsNullImg] hash=0x%016llx res=%u kind=%u addr=0x%llx %ux%u\n",
 								             (unsigned long long)compute_info.stage.program->shader_hash, res,

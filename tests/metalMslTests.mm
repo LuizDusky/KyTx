@@ -351,15 +351,18 @@ static void RawBufferBounds() {
 
 static void StorageImageChannelMapping() {
 	constexpr uint32_t reverse = 7u | (6u << 3u) | (5u << 6u) | (4u << 9u);
-	const uint32_t texture_formats[] = {32, 32, 16};
+	const uint32_t texture_formats[] = {32, 32, 16, 32};
 	for (size_t check = 0; check < std::size(texture_formats); ++check) {
-		const bool sparse = check != 0;
+		const bool array = check == 3;
+		const bool sparse = check == 1 || check == 2;
 		const bool packed_16 = texture_formats[check] == 16;
+		const uint32_t slice = array ? 5u : 0u;
 		Fixture f(0);
 		IR::ImageResource image {};
 		image.resource_class = IR::ImageResourceClass::Storage;
 		image.numeric_class = Prospero::TextureNumericClass::Float;
-		image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+		using Dimension = ShaderRecompiler::Decoder::ImageDimension;
+		image.dimension = array ? Dimension::Dim2DArray : Dimension::Dim3D;
 		image.shader_swizzle = reverse;
 		image.written = true;
 		f.program.info.images.push_back(image);
@@ -367,7 +370,7 @@ static void StorageImageChannelMapping() {
 		const auto handle = f.Emit(0, ValueOpcode::GetImageResource,
 		    {Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u)});
 		const auto address = f.Emit(0, ValueOpcode::MakeImageAddress,
-		    {Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),
+		    {Value(0u),Value(0u),Value(slice),Value(0u),Value(0u),Value(0u),Value(0u),
 		     Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(0u)});
 		IR::MemoryInfo memory {};
 		memory.kind = IR::ResourceKind::Image;
@@ -389,32 +392,36 @@ static void StorageImageChannelMapping() {
 		id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
 		Check(pipeline != nil, "storage image mapping pipeline failed");
 		MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
-		    width:1 height:1 mipmapped:NO];
-		desc.textureType = MTLTextureType3D;
+		    width:array ? 2u : 1u height:array ? 2u : 1u mipmapped:array];
+		desc.textureType = array ? MTLTextureType2DArray : MTLTextureType3D;
+		desc.arrayLength = array ? 6u : 1u;
 		desc.storageMode = MTLStorageModeShared;
-		desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+		desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
 		id<MTLTexture> texture = [device newTextureWithDescriptor:desc];
+		id<MTLTexture> target = array ? [texture newTextureViewWithPixelFormat:texture.pixelFormat
+		    textureType:MTLTextureType2DArray levels:NSMakeRange(1, 1) slices:NSMakeRange(0, 6)] : texture;
+		Check(target != nil, "storage image mapping texture view failed");
 		id<MTLArgumentEncoder> args = [function newArgumentEncoderWithBufferIndex:0];
 		id<MTLBuffer> argbuf = [device newBufferWithLength:args.encodedLength options:MTLResourceStorageModeShared];
 		[args setArgumentBuffer:argbuf offset:0];
-		[args setTexture:texture atIndex:64];
+		[args setTexture:target atIndex:64];
 		const uint32_t push[32] {}, sizes[64] {};
 		id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
 		id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
 		[encoder setComputePipelineState:pipeline]; [encoder setBuffer:argbuf offset:0 atIndex:0];
 		[encoder setBytes:push length:sizeof(push) atIndex:1]; [encoder setBytes:sizes length:sizeof(sizes) atIndex:25];
-		[encoder useResource:texture usage:MTLResourceUsageWrite];
+		[encoder useResource:target usage:MTLResourceUsageWrite];
 		[encoder dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
 		[encoder endEncoding]; [command commit]; [command waitUntilCompleted];
 		Check(command.status == MTLCommandBufferStatusCompleted, "storage image mapping dispatch failed");
 		float result[4] {};
 		[texture getBytes:result bytesPerRow:16 bytesPerImage:16 fromRegion:MTLRegionMake3D(0,0,0,1,1,1)
-		    mipmapLevel:0 slice:0];
+		    mipmapLevel:array ? 1u : 0u slice:slice];
 		const float expected[] = {sparse ? 0.0f : 1.0f, 0.5f, sparse ? 0.0f : 0.375f, 0.25f};
 		Check(std::equal(std::begin(result), std::end(result), expected),
 		      "storage image ignored inverse DST_SEL or compacted DMASK");
 	}
-	std::puts("Storage image channel mapping: 3 GPU cases passed");
+	std::printf("Storage image channel mapping: %zu GPU cases passed\n", std::size(texture_formats));
 }
 
 static void DeclaredLds() {

@@ -607,6 +607,30 @@ static void PackMeshTriangleIndices(std::string& msl) {
 	msl = std::move(packed);
 }
 
+// Write just the selected shader when a hash filter is given.
+static void DumpMslSource(NSString* source_str, uint64_t shader_hash) {
+	const char* dump_hash = KYTY_ENV("KYTY_MSL_DUMP_HASH");
+	if (const char* dump_dir = KYTY_ENV("KYTY_MSL_DUMP_DIR");
+	    dump_dir && (!dump_hash || std::strtoull(dump_hash, nullptr, 16) == shader_hash)) {
+		NSString* directory = [NSString stringWithUTF8String:dump_dir];
+		NSError* dump_error = nil;
+		if (directory == nil || directory.length == 0) {
+			std::fprintf(stderr, "[MslDump] invalid or empty KYTY_MSL_DUMP_DIR\n");
+		} else if (![[NSFileManager defaultManager] createDirectoryAtPath:directory
+		                                      withIntermediateDirectories:YES attributes:nil error:&dump_error]) {
+			std::fprintf(stderr, "[MslDump] cannot create %s: %s\n", dump_dir,
+			             dump_error.localizedDescription.UTF8String);
+		} else {
+			NSString* filename = [NSString stringWithFormat:@"0x%016llx.metal", static_cast<unsigned long long>(shader_hash)];
+			NSString* path = [directory stringByAppendingPathComponent:filename];
+			if (![source_str writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&dump_error]) {
+				std::fprintf(stderr, "[MslDump] cannot write %s: %s\n", path.UTF8String,
+				             dump_error.localizedDescription.UTF8String);
+			}
+		}
+	}
+}
+
 MetalShaderCompileResult MetalShaderManager::CompileSpirvToFunction(
     std::span<const uint32_t> spirv,
     const char* entry_point,
@@ -759,6 +783,7 @@ MetalShaderCompileResult MetalShaderManager::CompileSpirvToFunction(
 
 		NSError*  error      = nil;
 		NSString* source_str = [NSString stringWithUTF8String:result.msl_source.c_str()];
+		DumpMslSource(source_str, shader_hash);
 		id<MTLLibrary> library =
 		    [device newLibraryWithSource:source_str options:compile_options error:&error];
 		if (!library) {
@@ -912,25 +937,7 @@ MetalShaderCompileResult MetalShaderManager::CompileMslToFunction(
 		// Pixel shader probes (KYTY_PS_PROBE) rewrite the entry returns of natively emitted MSL as well.
 		ApplyPsProbe(result.msl_source, shader_hash);
 		NSString* source_str = [NSString stringWithUTF8String:result.msl_source.c_str()];
-		// KYTY_MSL_DUMP_DIR=<dir>: write the generated MSL of every directly compiled program as <dir>/<hash>.metal.
-		if (const char* dump_dir = KYTY_ENV("KYTY_MSL_DUMP_DIR")) {
-			NSString* directory = [NSString stringWithUTF8String:dump_dir];
-			NSError* dump_error = nil;
-			if (directory == nil || directory.length == 0) {
-				std::fprintf(stderr, "[MslDump] invalid or empty KYTY_MSL_DUMP_DIR\n");
-			} else if (![[NSFileManager defaultManager] createDirectoryAtPath:directory
-			                                      withIntermediateDirectories:YES attributes:nil error:&dump_error]) {
-				std::fprintf(stderr, "[MslDump] cannot create %s: %s\n", dump_dir,
-				             dump_error.localizedDescription.UTF8String);
-			} else {
-				NSString* filename = [NSString stringWithFormat:@"0x%016llx.metal", static_cast<unsigned long long>(shader_hash)];
-				NSString* path = [directory stringByAppendingPathComponent:filename];
-				if (![source_str writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&dump_error]) {
-					std::fprintf(stderr, "[MslDump] cannot write %s: %s\n", path.UTF8String,
-					             dump_error.localizedDescription.UTF8String);
-				}
-			}
-		}
+		DumpMslSource(source_str, shader_hash);
 		id<MTLLibrary> library =
 		    [device newLibraryWithSource:source_str options:compile_options error:&error];
 		if (!library) {

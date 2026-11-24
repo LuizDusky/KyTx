@@ -8,9 +8,8 @@ It replaces the upstream x86-64 + Rosetta 2 + MoltenVK setup with a native ARM64
 
 - **Guest CPU:** x86-64 game code runs under [FEX](https://github.com/FEX-Emu/FEX) (FEXCore embedded in-process),
   not Rosetta 2.
-- **GPU:** RDNA shaders are translated straight to Metal Shading Language and PM4 command streams are executed on a
-  native Metal backend (`src/graphics/host_gpu/metal/`). The product path uses no Vulkan, MoltenVK or SPIRV-Cross; the
-  inherited Vulkan renderer is kept only as a diagnostic reference.
+- **GPU:** PM4 command streams execute on a native Metal backend (`src/graphics/host_gpu/metal/`).
+  The shader recompiler emits Metal Shading Language directly for supported stages and uses SPIRV-Cross for mesh translation.
 
 > [!IMPORTANT]
 > Prospero is not affiliated with Sony Interactive Entertainment, PlayStation or any game publisher. The project does not

@@ -1,112 +1,53 @@
-<p align="center">
-  <img src="docs/branding/prospero.svg" alt="Prospero — native PlayStation 5 emulation for Apple Silicon" width="760"/>
-</p>
-
-<p align="center">
-  <a href="#architecture"><img src="https://img.shields.io/badge/Platform-macOS-101218?style=flat-square&logo=apple&logoColor=white" alt="macOS"/></a>
-  <a href="#requirements"><img src="https://img.shields.io/badge/Architecture-ARM64-778BEA?style=flat-square" alt="ARM64"/></a>
-  <a href="#architecture"><img src="https://img.shields.io/badge/Graphics-Metal%204-778BEA?style=flat-square" alt="Metal 4"/></a>
-  <a href="#compatibility"><img src="https://img.shields.io/badge/Status-Experimental-D99B50?style=flat-square" alt="Experimental"/></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--2.0-AABAFF?style=flat-square" alt="GPL-2.0"/></a>
-</p>
-
-<p align="center">
-  <a href="#architecture">Architecture</a> ·
-  <a href="#compatibility">Compatibility</a> ·
-  <a href="#building">Building</a> ·
-  <a href="#contributing">Contributing</a> ·
-  <a href="#credits">Credits</a>
-</p>
-
----
-
 # Prospero
 
-**An experimental PlayStation 5 emulator built around Apple Silicon.**
+**Prospero** is a fork of [KyTx](https://github.com/TxCsOffc/KyTx) focused on
+making native Apple Silicon PlayStation 5 emulation easier to build, test and use.
+KyTx builds on [KytyPS5](https://github.com/KytyPS5/KytyPS5) and
+[Kyty](https://github.com/InoriRus/Kyty).
+It replaces the upstream x86-64 + Rosetta 2 + MoltenVK setup with a native ARM64 build:
 
-Prospero explores a native ARM64 host architecture for PS5 emulation on macOS, building on [KyTx](https://github.com/TxCsOffc/KyTx), [KytyPS5](https://github.com/KytyPS5/KytyPS5) and [Kyty](https://github.com/InoriRus/Kyty). Rather than relying on Rosetta 2 and MoltenVK, it embeds FEXCore for guest CPU execution and implements a native Metal graphics backend.
+- **Guest CPU:** x86-64 game code runs under [FEX](https://github.com/FEX-Emu/FEX) (FEXCore embedded in-process),
+  not Rosetta 2.
+- **GPU:** PM4 command streams execute on a native Metal backend (`src/graphics/host_gpu/metal/`).
+  The shader recompiler emits Metal Shading Language directly for supported stages and uses SPIRV-Cross for mesh translation.
 
-> [!WARNING]
-> Prospero is in early development. Rendering errors, crashes and GPU hangs are known limitations. Broad game compatibility, full-speed gameplay and reproducible public builds are not yet established.
-
-## Architecture
-
-| Subsystem | Approach |
-| :--- | :--- |
-| Host CPU | Native ARM64 on Apple Silicon |
-| Guest CPU | x86-64 execution via embedded [FEXCore](https://github.com/FEX-Emu/FEX), without Rosetta 2 |
-| Graphics commands | PM4 command streams executed by a native Metal backend |
-| Shader translation | RDNA to Metal Shading Language (MSL) |
-| Graphics API | Metal; no Vulkan, MoltenVK or SPIRV-Cross on the intended native path |
-| Diagnostic reference | Inherited Vulkan renderer retained for comparison |
-
-```mermaid
-flowchart TD
-    A["PS5 guest workload"] --> B["x86-64 guest code"]
-    A --> C["PM4 commands and RDNA shaders"]
-    B --> D["Embedded FEXCore"]
-    D --> E["Apple Silicon / ARM64"]
-    C --> F["Native Metal backend"]
-    F --> G["Metal Shading Language / Metal GPU"]
-```
-
-The native graphics implementation lives in [`src/graphics/host_gpu/metal/`](src/graphics/host_gpu/metal/). The diagram is a high-level overview, not a complete execution model.
+> [!IMPORTANT]
+> Prospero is not affiliated with Sony Interactive Entertainment, PlayStation or any game publisher. The project does not
+> distribute games, game data or copyrighted system software. Use only game files that you have obtained legally.
 
 ## Compatibility
 
-Development observations on an **M5 Max with 48 GB of memory**:
+| Game | Observed behavior |
+|---|---|
+| Is This Seat Taken? | On a Mac mini M4, reaches the title menu, Barcelona map and first level. |
+| Gran Turismo 7 1.71 | On a Mac mini M4, boots to the World Map. The landscape and menu labels still render incorrectly. [GT7 findings](docs/bringup/gt7-metal.md) |
+| EA SPORTS FC 27 | In the original KyTx tests on an M5 Max, reached the main menu and a match with rendering errors and occasional crashes or GPU hangs. |
 
-| Title | Menu | In-game | Known limitations |
-| :--- | :--- | :--- | :--- |
-| EA SPORTS FC 27 | Boots, 30 FPS (game cap) | Match gameplay, 30–37 FPS (60 FPS target) | Significant rendering errors, occasional crashes and GPU hangs |
-| Other titles, including UFC 5 | Untested on main | Untested on main | See pending branch observations below |
+Prospero is an experimental macOS build for Apple Silicon with Metal 4.
 
-These are preliminary developer observations, not independently reproduced benchmarks or a guarantee of compatibility.
+## Build and test
 
-### Development branches — pending integration
+Follow the [macOS ARM64 build guide](docs/bringup/macos-arm64.md) for the pinned
+FEXCore revision, dependencies and game launch command. The
+[GT7 bring-up notes](docs/bringup/gt7-metal.md) list the descriptor and shader
+regression tests and explain how to reproduce the Metal captures.
 
-The following observations and features are reported in open pull requests, not in the current main build.
+## Open games
 
-| Title | Development observation | Branch |
-| :--- | :--- | :--- |
-| Is This Seat Taken? | Mac mini M4: title menu, Barcelona map and first level reached; audio remains unverified. | [ARM64 / Unity bring-up](https://github.com/LuizDusky/Prospero/pull/2) |
-| Gran Turismo 7 1.71 | Mac mini M4: World Map reached, with incomplete landscape and missing menu text; approximately 8 FPS median in two documented map runs. | [GT7 Metal bring-up](https://github.com/LuizDusky/Prospero/pull/6) |
+Build the native launcher with `bash tools/build_prospero_launcher.sh /path/to/build/kytx`.
+Open `Prospero.app` beside `kyty_emulator`, then add a game directory, .pkg, or
+.fpkg to the library. You can also use Finder's **Open With** menu for package files.
 
-The GT7 branch also introduces a native macOS launcher, a game library, configurable video output, package import via a separate compatible reader, and a pinned external FEXCore build guide. Its graphics path adds SPIRV-Cross mesh translation alongside direct MSL emission for supported stages. These changes are under review and should not be assumed available on main.
+Prospero starts games in a 1920×1080 window and defaults to 1080p Video Out and
+a 60 Hz virtual refresh rate. **Settings → Video** controls the mode reported to
+the game. Games choose their internal render resolution.
 
-Other integration reviews: [storage-image component selectors](https://github.com/LuizDusky/Prospero/pull/3), [sRGB presentation](https://github.com/LuizDusky/Prospero/pull/4), and [compute LDS preservation](https://github.com/LuizDusky/Prospero/pull/5).
-
-See the branch-specific [ARM64 build guide](https://github.com/LuizDusky/Prospero/blob/prospero/gt7-metal/docs/bringup/macos-arm64.md) and [GT7 technical notes](https://github.com/LuizDusky/Prospero/blob/prospero/gt7-metal/docs/bringup/gt7-metal.md) for details. These reports are developer observations, not independent verification.
-
-## Requirements
-
-- Apple Silicon Mac with a Metal 4 capable GPU.
-- macOS; Windows and Linux are not supported by this fork, although inherited platform code remains in the tree.
-- CMake and the required native build toolchain.
-- A compatible FEX-darwin source/build tree (currently external to this repository).
-- Legally obtained game files.
-
-The M5 Max is the development machine, not a verified minimum hardware specification.
-
-## Building
-
-> [!IMPORTANT]
-> A fresh clone alone is not sufficient to build Prospero today. The FEX-darwin dependency is not yet included in the repository, and the commands below assume an existing configured CMake build directory.
-
-CMake looks for FEX-darwin at `~/Developer/fex-darwin`. Override the relevant paths with `KYTY_FEX_DIR`, `KYTY_FEX_BUILD_DIR` and `KYTY_FEX_SHIMS_DIR`.
-
-With those dependencies and the build directory configured:
-
-```bash
-cmake --build _Build/macos-arm64 --target kyty_emulator -j$(sysctl -n hw.logicalcpu)
-```
-
-Run using the native Metal backend:
-
-```bash
-KYTY_BACKEND=metal KYTY_MSL_ONLY=1 KYTY_VIDEO_OUT_1080P=1 \
-  _Build/macos-arm64/kyty_emulator --game /path/to/your/game
-```
+For supported PS5 packages, Prospero streams the original file using a compatible
+`read-fpkg` helper. The launcher looks beside the emulator and in
+`../fpkg-reader/read-fpkg` relative to the emulator directory. Use **Settings →
+Package reader** to select a helper elsewhere. The helper and its dependencies
+are separate from the launcher. A game-specific JSON patch can be selected in
+**Game Options**.
 
 ## Development priorities
 

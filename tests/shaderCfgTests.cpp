@@ -10825,8 +10825,17 @@ void TestNewShaderRecompilerAuxPositionExports() {
             SpirvStoredBuiltInElements(all.spirv, 9u) ==
                 std::vector<uint32_t>({UINT32_MAX}),
         "MISC point-size/layer stores are missing");
+#if defined(__APPLE__)
+  const std::vector<uint32_t> all_clip_stores = {0u, 3u};
+  const std::vector<uint32_t> dense_clip_stores = {1u};
+  const std::vector<uint32_t> shifted_clip_stores = {0u};
+#else
+  const std::vector<uint32_t> all_clip_stores = {0u, 3u, 4u};
+  const std::vector<uint32_t> dense_clip_stores = {1u, 2u};
+  const std::vector<uint32_t> shifted_clip_stores = {0u, 1u};
+#endif
   Check(SpirvStoredBuiltInElements(all.spirv, 3u) ==
-            std::vector<uint32_t>({0u, 3u, 4u}) &&
+            all_clip_stores &&
             SpirvStoredBuiltInElements(all.spirv, 4u) ==
                 std::vector<uint32_t>({0u, 1u, 2u}),
         "partial clip/cull exports or the appended clipping-error plane used the wrong elements");
@@ -10863,7 +10872,7 @@ void TestNewShaderRecompilerAuxPositionExports() {
   CheckSpirvBinaryValidates(dense.spirv);
   Check(SpirvStoredBuiltInElements(dense.spirv, 0u).size() == 1u &&
             SpirvStoredBuiltInElements(dense.spirv, 3u) ==
-                std::vector<uint32_t>({1u, 2u}) &&
+                dense_clip_stores &&
             SpirvStoredBuiltInElements(dense.spirv, 4u) ==
                 std::vector<uint32_t>({0u}),
         "CCDIST1 was not densely packed into POS1");
@@ -10878,7 +10887,7 @@ void TestNewShaderRecompilerAuxPositionExports() {
   CheckSpirvBinaryValidates(shifted.spirv);
   Check(SpirvStoredBuiltInElements(shifted.spirv, 1u).size() == 1u &&
             SpirvStoredBuiltInElements(shifted.spirv, 3u) ==
-                std::vector<uint32_t>({0u, 1u}) &&
+                shifted_clip_stores &&
             SpirvStoredBuiltInElements(shifted.spirv, 4u) ==
                 std::vector<uint32_t>({0u}),
         "CCDIST1 did not shift across a disabled CCDIST0 vector");
@@ -14067,8 +14076,13 @@ void TestRepeatedExportsHaveOneInterface() {
     }
     offset += result.spirv[offset] >> spv::WordCountShift;
   }
+#if defined(__APPLE__)
+  Check(outputs == 1 && !SpirvHasDecorationValue(result.spirv, 11u, 3u),
+        "repeated exports duplicated Position on macOS");
+#else
   Check(outputs == 2 && SpirvHasDecorationValue(result.spirv, 11u, 3u),
         "repeated exports duplicated Position or its clipping-error plane");
+#endif
 }
 
 void TestNewShaderRecompilerSpirvSizeBaselines() {

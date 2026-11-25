@@ -1654,7 +1654,7 @@ struct Emitter {
 					return;
 				}
 				const std::string lod =
-				    image.mip_mode == IR::ImageMipMode::Dynamic
+				    mem.image_has_mip && mem.image_address_components > dim.components
 				        ? AddressU32(*address, mem, static_cast<uint32_t>(dim.components)) : "0u";
 				EmitAssignment(inst, TexelBits(image,
 				                               tex + ".read(" + coord + array_arg + ", " + lod + ")", &mem));

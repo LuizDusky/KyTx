@@ -158,9 +158,12 @@ static void ImageSampling() {
 		int gather_component; // -1 = sample
 		uint32_t expected_layer;
 		bool cube = false;
+		bool read_mip = false;
 	};
 	const Case cases[] = {
 	    {"2D explicit LOD", Dimension::Dim2D, 0, false, -1, 0},
+	    {"2D integer mip read", Dimension::Dim2D, 0, false, -1, 0, false, true},
+	    {"array integer mip read", Dimension::Dim2DArray, 1, false, -1, 1, false, true},
 	    {"2D gradients", Dimension::Dim2D, 0, true, -1, 0},
 	    {"array middle layer", Dimension::Dim2DArray, 1, false, -1, 1},
 	    {"array round down", Dimension::Dim2DArray, 0.49f, false, -1, 0},
@@ -187,7 +190,7 @@ static void ImageSampling() {
 			image.resource_class = IR::ImageResourceClass::Sampled;
 			image.numeric_class = Prospero::TextureNumericClass::Float;
 			image.dimension = test.dimension;
-			image.mip_mode = IR::ImageMipMode::Dynamic;
+			image.mip_mode = test.read_mip ? IR::ImageMipMode::None : IR::ImageMipMode::Dynamic;
 			image.mip_count = 5;
 			image.read = true;
 			image.cube = test.cube;
@@ -209,9 +212,15 @@ static void ImageSampling() {
 				for (uint32_t i = 0; i < spatial; ++i) coordinate(i == 0 ? 0.25f : 0.0f);
 				for (uint32_t i = 0; i < spatial; ++i) coordinate(i == 1 ? 0.25f : 0.0f);
 			}
-			for (uint32_t i = 0; i < spatial; ++i) coordinate(0.5f);
-			if (arrayed) coordinate(test.layer);
-			if (!test.derivative && !gather) coordinate(2.0f);
+			if (test.read_mip) {
+				for (uint32_t i = 0; i < spatial; ++i) address[cursor++] = Value(1u);
+				if (arrayed) address[cursor++] = Value(test.expected_layer);
+				address[cursor++] = Value(2u);
+			} else {
+				for (uint32_t i = 0; i < spatial; ++i) coordinate(0.5f);
+				if (arrayed) coordinate(test.layer);
+				if (!test.derivative && !gather) coordinate(2.0f);
+			}
 			const auto coords = f.Emit(0, ValueOpcode::MakeImageAddress,
 			    {address[0],address[1],address[2],address[3],address[4],address[5],address[6],
 			     address[7],address[8],address[9],address[10],address[11],address[12]});
@@ -221,10 +230,13 @@ static void ImageSampling() {
 			memory.dmask = gather ? (1u << test.gather_component) : 0xfu;
 			memory.image_sample_flags = test.derivative ? Decoder::ImageSampleFlagDerivative
 			    : gather ? 0u : Decoder::ImageSampleFlagLod;
+			memory.image_has_mip = test.read_mip;
 			memory.image_dimension = test.dimension;
 			memory.image_address_components = cursor;
 			f.program.memory_info.push_back(memory);
-			const auto sampled = gather
+			const auto sampled = test.read_mip
+			    ? f.Emit(0, ValueOpcode::ImageRead, {texture_handle, coords, Value(true)}, image_memory)
+			    : gather
 			    ? f.Emit(0, ValueOpcode::ImageGatherRaw, {texture_handle, sampler_handle, coords,
 			          Value(0u),Value(0u),Value(0u),Value(0u)}, image_memory)
 			    : f.Emit(0, ValueOpcode::ImageSampleRaw, {texture_handle, sampler_handle, coords}, image_memory);

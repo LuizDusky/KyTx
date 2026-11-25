@@ -38,6 +38,10 @@ Build the native launcher with `bash tools/build_prospero_launcher.sh /path/to/b
 Open `Prospero.app` beside `kyty_emulator`, then add a game directory, .pkg, or
 .fpkg to the library. You can also use Finder's **Open With** menu for package files.
 
+Prospero starts games in a 1920×1080 window and defaults to 1080p Video Out and
+a 60 Hz virtual refresh rate. **Settings → Video** controls the mode reported to
+the game. Games choose their internal render resolution.
+
 For supported PS5 packages, Prospero streams the original file using a compatible
 `read-fpkg` helper. The launcher looks beside the emulator and in
 `../fpkg-reader/read-fpkg` relative to the emulator directory. Use **Settings →

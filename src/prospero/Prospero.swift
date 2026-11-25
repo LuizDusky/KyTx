@@ -2,6 +2,13 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+private enum VirtualRefreshRate: Int {
+    case hz60 = 60
+    case hz120 = 120
+
+    static let standard = Self.hz60
+}
+
 struct LibraryGame: Codable, Identifiable, Hashable {
     let path: String
     let title: String
@@ -41,6 +48,11 @@ final class Library: ObservableObject {
     private var emulatorProcess: Process?
 
     init() {
+        UserDefaults.standard.register(defaults: [
+            "tessellation": true,
+            "window1080": true,
+            "virtualRefreshRate": VirtualRefreshRate.standard.rawValue
+        ])
         if let data = UserDefaults.standard.data(forKey: "games"),
            let decoded = try? JSONDecoder().decode([LibraryGame].self, from: data) {
             games = decoded
@@ -119,13 +131,17 @@ final class Library: ObservableObject {
         }
     }
 
-    func launch(_ game: LibraryGame, core: String, reader: String,
-                tessellation: Bool, window1080: Bool) {
+    func launch(_ game: LibraryGame) {
         guard emulatorProcess == nil else { return }
         guard FileManager.default.fileExists(atPath: game.path) else {
             error = "The game is unavailable. Connect its drive and try again."
             return
         }
+        let defaults = UserDefaults.standard
+        let core = defaults.string(forKey: "core") ?? ""
+        let reader = defaults.string(forKey: "reader") ?? ""
+        let refreshRate = VirtualRefreshRate(rawValue: defaults.integer(forKey: "virtualRefreshRate"))
+            ?? .standard
         let corePath = core.isEmpty ? Bundle.main.bundleURL.deletingLastPathComponent()
             .appendingPathComponent("kyty_emulator").path : core
         guard FileManager.default.isExecutableFile(atPath: corePath) else {
@@ -149,11 +165,12 @@ final class Library: ObservableObject {
         environment["KYTY_BACKEND"] = "metal"
         environment["KYTY_MSL_ONLY"] = "1"
         environment["KYTY_MSL_GDS"] = "1"
-        environment["KYTY_VIDEO_OUT_1080P"] = window1080 ? "1" : nil
+        environment["KYTY_VIDEO_OUT_1080P"] = defaults.bool(forKey: "window1080") ? "1" : nil
         environment["KYTY_FPKG_READER"] = resolvedReader
         process.environment = environment
-        var arguments = ["--game", game.path]
-        if tessellation { arguments += ["--tessellation"] }
+        var arguments = ["--game", game.path, "--screen-width", "1920", "--screen-height", "1080",
+                         "--vblank-frequency", String(refreshRate.rawValue)]
+        if defaults.bool(forKey: "tessellation") { arguments += ["--tessellation"] }
         if let patch = game.patch { arguments += ["--game-patch", patch] }
         process.arguments = arguments
         process.terminationHandler = { [weak self] ended in
@@ -179,10 +196,6 @@ final class Library: ObservableObject {
 
 struct LibraryView: View {
     @ObservedObject var library: Library
-    @AppStorage("core") private var core = ""
-    @AppStorage("reader") private var reader = ""
-    @AppStorage("tessellation") private var tessellation = true
-    @AppStorage("window1080") private var window1080 = true
 
     var body: some View {
         NavigationSplitView {
@@ -223,8 +236,7 @@ struct LibraryView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Button(library.running == game.id ? "Running" : "Play", systemImage: "play.fill") {
-                        library.launch(game, core: core, reader: reader,
-                                       tessellation: tessellation, window1080: window1080)
+                        library.launch(game)
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(library.running != nil)
@@ -262,6 +274,7 @@ struct ProsperoSettings: View {
     @AppStorage("reader") private var reader = ""
     @AppStorage("tessellation") private var tessellation = true
     @AppStorage("window1080") private var window1080 = true
+    @AppStorage("virtualRefreshRate") private var virtualRefreshRate = VirtualRefreshRate.standard
     @AppStorage("appearance") private var appearance = "system"
 
     var body: some View {
@@ -270,7 +283,15 @@ struct ProsperoSettings: View {
                 FileSetting(title: "Executable", path: $core, defaultLabel: "Use adjacent emulator")
                 FileSetting(title: "Package reader", path: $reader, defaultLabel: "Find adjacent reader")
                 Toggle("Enable tessellation", isOn: $tessellation)
-                Toggle("Request a 1080p output window", isOn: $window1080)
+            }
+            Section("Video") {
+                Toggle("Report 1080p to games", isOn: $window1080)
+                Picker("Virtual refresh rate", selection: $virtualRefreshRate) {
+                    Text("60 Hz").tag(VirtualRefreshRate.hz60)
+                    Text("120 Hz").tag(VirtualRefreshRate.hz120)
+                }
+                Text("Games choose their internal render resolution.")
+                    .foregroundStyle(.secondary)
             }
             Picker("Appearance", selection: $appearance) {
                 Text("System").tag("system")
@@ -324,11 +345,7 @@ final class ProsperoAppDelegate: NSObject, NSApplicationDelegate {
             library.setPatch(patchPath, for: game)
             game.patch = patchPath
         }
-        let defaults = UserDefaults.standard
-        library.launch(game, core: defaults.string(forKey: "core") ?? "",
-                       reader: defaults.string(forKey: "reader") ?? "",
-                       tessellation: defaults.object(forKey: "tessellation") == nil || defaults.bool(forKey: "tessellation"),
-                       window1080: defaults.object(forKey: "window1080") == nil || defaults.bool(forKey: "window1080"))
+        library.launch(game)
     }
 }
 

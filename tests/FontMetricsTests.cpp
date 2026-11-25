@@ -1,9 +1,11 @@
 #include "libs/libFont.cpp"
 
 namespace Loader {
+#if KYTY_GUEST_CPU_EMULATED
 namespace GuestCpu {
 uint64_t GetHostFunctionStub(uint64_t address, const char*) { return address; }
 } // namespace GuestCpu
+#endif
 void SymbolDatabase::Add(const SymbolResolve&, uint64_t, const std::string&) {}
 namespace Timer {
 double GetTimeMs() { return 0.0; }

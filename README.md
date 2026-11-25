@@ -1,3 +1,26 @@
+<p align="center">
+  <img src="docs/branding/prospero.svg" alt="Prospero — native PlayStation 5 emulation for Apple Silicon" width="760"/>
+</p>
+
+<p align="center">
+  <a href="#architecture"><img src="https://img.shields.io/badge/Platform-macOS-101218?style=flat-square&logo=apple&logoColor=white" alt="macOS"/></a>
+  <a href="#requirements"><img src="https://img.shields.io/badge/Architecture-ARM64-778BEA?style=flat-square" alt="ARM64"/></a>
+  <a href="#architecture"><img src="https://img.shields.io/badge/Graphics-Metal%204-778BEA?style=flat-square" alt="Metal 4"/></a>
+  <a href="#compatibility"><img src="https://img.shields.io/badge/Status-Experimental-D99B50?style=flat-square" alt="Experimental"/></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--2.0-AABAFF?style=flat-square" alt="GPL-2.0"/></a>
+</p>
+
+<p align="center">
+  <a href="#architecture">Architecture</a> ·
+  <a href="#compatibility">Compatibility</a> ·
+  <a href="#build-and-test">Building</a> ·
+  <a href="#open-games">Launcher</a> ·
+  <a href="#contributing">Contributing</a> ·
+  <a href="#credits">Credits</a>
+</p>
+
+---
+
 # Prospero
 
 **Prospero** is a fork of [KyTx](https://github.com/TxCsOffc/KyTx) focused on
@@ -15,15 +38,51 @@ It replaces the upstream x86-64 + Rosetta 2 + MoltenVK setup with a native ARM64
 > Prospero is not affiliated with Sony Interactive Entertainment, PlayStation or any game publisher. The project does not
 > distribute games, game data or copyrighted system software. Use only game files that you have obtained legally.
 
+## Architecture
+
+| Subsystem | Approach |
+| :--- | :--- |
+| Host CPU | Native ARM64 on Apple Silicon |
+| Guest CPU | x86-64 execution via embedded [FEXCore](https://github.com/FEX-Emu/FEX), without Rosetta 2 |
+| Graphics commands | PM4 command streams executed by a native Metal backend |
+| Shader translation | Direct Metal Shading Language (MSL) for supported stages; SPIRV-Cross for mesh translation |
+| Graphics API | Native Metal backend, without MoltenVK |
+| Diagnostic reference | Inherited Vulkan renderer retained for comparison |
+
+```mermaid
+flowchart TD
+    A["PS5 guest workload"] --> B["x86-64 guest code"]
+    A --> C["PM4 commands and RDNA shaders"]
+    B --> D["Embedded FEXCore"]
+    D --> E["Apple Silicon / ARM64"]
+    C --> F["Native Metal backend"]
+    F --> G["Metal GPU"]
+    C --> H["Shader recompiler"]
+    H --> I["Direct MSL / SPIRV-Cross mesh translation"]
+    I --> G
+```
+
+The native graphics implementation lives in [`src/graphics/host_gpu/metal/`](src/graphics/host_gpu/metal/). The diagram is a high-level overview, not a complete execution model.
+
 ## Compatibility
 
-| Game | Observed behavior |
-|---|---|
-| Is This Seat Taken? | On a Mac mini M4, reaches the title menu, Barcelona map and first level. |
-| Gran Turismo 7 1.71 | On a Mac mini M4, boots to the World Map. The landscape and menu labels still render incorrectly. [GT7 findings](docs/bringup/gt7-metal.md) |
-| EA SPORTS FC 27 | In the original KyTx tests on an M5 Max, reached the main menu and a match with rendering errors and occasional crashes or GPU hangs. |
+> [!WARNING]
+> Prospero remains experimental. These are reported development observations, not guarantees of compatibility or independently reproduced benchmarks.
+
+| Game | Hardware | Observed progress | Known limitations |
+| :--- | :--- | :--- | :--- |
+| Is This Seat Taken? | Mac mini M4 | Title menu, Barcelona map and first level | Audio remains unverified |
+| Gran Turismo 7 1.71 | Mac mini M4 | World Map; approximately 8 FPS median in two documented runs | Incomplete landscape and missing menu labels; see [GT7 findings](docs/bringup/gt7-metal.md) |
+| EA SPORTS FC 27 | M5 Max | Main menu and match in original KyTx testing | Rendering errors, occasional crashes and GPU hangs; not independently retested on Prospero |
 
 Prospero is an experimental macOS build for Apple Silicon with Metal 4.
+
+### Requirements
+
+- Apple Silicon Mac with a Metal 4 capable GPU.
+- macOS, Xcode and the native build dependencies specified in the ARM64 guide.
+- The pinned external FEXCore dependency described in the guide.
+- Legally obtained game files.
 
 ## Build and test
 
@@ -53,7 +112,7 @@ are separate from the launcher. A game-specific JSON patch can be selected in
 
 The following areas are proposed priorities for improving the project:
 
-- [ ] Document a reproducible ARM64 build and external FEX dependency setup.
+- [ ] Validate the documented ARM64 build on fresh systems.
 - [ ] Improve shader translation and rendering correctness.
 - [ ] Investigate GPU hangs and runtime stability.
 - [ ] Establish repeatable compatibility and performance tests.
@@ -77,7 +136,6 @@ Do not attach copyrighted game files, firmware, keys or other material you are n
 Prospero builds on the work of the open-source emulation community:
 
 - [KyTx](https://github.com/TxCsOffc/KyTx), the immediate upstream project.
-
 - [Kyty](https://github.com/InoriRus/Kyty) by InoriRus and contributors.
 - [KytyPS5](https://github.com/KytyPS5/KytyPS5) and its contributors.
 - The KytyPS5-UFC5 fork by Reece Ketley.

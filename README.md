@@ -24,7 +24,7 @@
 
 **An experimental PlayStation 5 emulator built around Apple Silicon.**
 
-Prospero explores a native ARM64 host architecture for PS5 emulation on macOS, building on [KytyPS5](https://github.com/KytyPS5/KytyPS5) and [Kyty](https://github.com/InoriRus/Kyty). Rather than relying on Rosetta 2 and MoltenVK, it embeds FEXCore for guest CPU execution and implements a native Metal graphics backend.
+Prospero explores a native ARM64 host architecture for PS5 emulation on macOS, building on [KyTx](https://github.com/TxCsOffc/KyTx), [KytyPS5](https://github.com/KytyPS5/KytyPS5) and [Kyty](https://github.com/InoriRus/Kyty). Rather than relying on Rosetta 2 and MoltenVK, it embeds FEXCore for guest CPU execution and implements a native Metal graphics backend.
 
 > [!WARNING]
 > Prospero is in early development. Rendering errors, crashes and GPU hangs are known limitations. Broad game compatibility, full-speed gameplay and reproducible public builds are not yet established.
@@ -59,9 +59,24 @@ Development observations on an **M5 Max with 48 GB of memory**:
 | Title | Menu | In-game | Known limitations |
 | :--- | :--- | :--- | :--- |
 | EA SPORTS FC 27 | Boots, 30 FPS (game cap) | Match gameplay, 30–37 FPS (60 FPS target) | Significant rendering errors, occasional crashes and GPU hangs |
-| Other titles, including UFC 5 | Untested | Untested | No compatibility claims |
+| Other titles, including UFC 5 | Untested on main | Untested on main | See pending branch observations below |
 
 These are preliminary developer observations, not independently reproduced benchmarks or a guarantee of compatibility.
+
+### Development branches — pending integration
+
+The following observations and features are reported in open pull requests, not in the current main build.
+
+| Title | Development observation | Branch |
+| :--- | :--- | :--- |
+| Is This Seat Taken? | Mac mini M4: title menu, Barcelona map and first level reached; audio remains unverified. | [ARM64 / Unity bring-up](https://github.com/LuizDusky/Prospero/pull/2) |
+| Gran Turismo 7 1.71 | Mac mini M4: World Map reached, with incomplete landscape and missing menu text; approximately 8 FPS median in two documented map runs. | [GT7 Metal bring-up](https://github.com/LuizDusky/Prospero/pull/6) |
+
+The GT7 branch also introduces a native macOS launcher, a game library, configurable video output, package import via a separate compatible reader, and a pinned external FEXCore build guide. Its graphics path adds SPIRV-Cross mesh translation alongside direct MSL emission for supported stages. These changes are under review and should not be assumed available on main.
+
+Other integration reviews: [storage-image component selectors](https://github.com/LuizDusky/Prospero/pull/3), [sRGB presentation](https://github.com/LuizDusky/Prospero/pull/4), and [compute LDS preservation](https://github.com/LuizDusky/Prospero/pull/5).
+
+See the branch-specific [ARM64 build guide](https://github.com/LuizDusky/Prospero/blob/prospero/gt7-metal/docs/bringup/macos-arm64.md) and [GT7 technical notes](https://github.com/LuizDusky/Prospero/blob/prospero/gt7-metal/docs/bringup/gt7-metal.md) for details. These reports are developer observations, not independent verification.
 
 ## Requirements
 
@@ -119,6 +134,8 @@ Do not attach copyrighted game files, firmware, keys or other material you are n
 ## Credits
 
 Prospero builds on the work of the open-source emulation community:
+
+- [KyTx](https://github.com/TxCsOffc/KyTx), the immediate upstream project.
 
 - [Kyty](https://github.com/InoriRus/Kyty) by InoriRus and contributors.
 - [KytyPS5](https://github.com/KytyPS5/KytyPS5) and its contributors.

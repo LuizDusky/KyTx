@@ -142,3 +142,19 @@ measure the proportion of wall time occupied by completed Metal work.
 With the same default title profile, the 60 Hz and 120 Hz virtual VBlank runs
 both used 3840×2160 in the World Map. Over guest flips 1500–1599, the two runs
 measured 8.4 and 8.5 fps, respectively, with six samples in each interval.
+
+## World Map recheck with the Prospero video defaults
+
+Launching GT7 1.71 from Prospero on the M4 initialized a 1920×1080 Metal
+drawable and advertised the 1080p Video Out mode with a 60 Hz virtual refresh
+rate. The game's presented texture remained 3840×2160. The coastline, roads,
+tree silhouettes, and parts of a few buildings were visible. The sky and
+backdrop were black, the bay remained too dark to distinguish from the terrain,
+and the shoreline appeared as a wide pale band. Some header icons rendered,
+while their labels and the pavilion labels were missing in the captures.
+
+The navigation replay used `KYTY_AUTO_INPUT_FILE` for Options (`enter`) and
+directional movement, and `KYTY_DUMP_TRIGGER` for the corresponding Metal
+frames. Left and right input changed which panel was visible. The panels stayed
+unlabeled, and Options did not produce a readable GT Menu. The available PS5
+frame shows the expected scene and menu; it was used as a visual reference.

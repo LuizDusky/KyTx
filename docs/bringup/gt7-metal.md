@@ -3,7 +3,8 @@
 Gran Turismo 7 1.71 reaches the World Map on a Mac mini M4. The PS5 reference
 shows the coastline, terrain, water, buildings and readable menu labels. The
 Metal capture preserves the coastline and some icons. The red overlay is gone.
-The landscape is still mostly black, and menu labels are missing.
+The landscape is still mostly black. World Map selection and header labels are
+readable, with uneven spacing.
 
 ## What changed since KyTx
 
@@ -158,3 +159,67 @@ directional movement, and `KYTY_DUMP_TRIGGER` for the corresponding Metal
 frames. Left and right input changed which panel was visible. The panels stayed
 unlabeled, and Options did not produce a readable GT Menu. The available PS5
 frame shows the expected scene and menu; it was used as a visual reference.
+
+### Glyph buffers and sky composition
+
+- GT7 uses mesh shader `0dc508aff99ad4f4` and pixel shader `165d5e4f4af6c314`
+  for these glyph draws. The M4 trace found R8 textures with nonzero texels
+  and a fragment probe marked some regions near the menu labels. Three mesh
+  buffers described 448 bytes each while the compiled fixed extents were 8,
+  16, and 16 bytes. Metal now maps the guest descriptors and removes the
+  extra offset from the mesh push constants because Metal binds the exact
+  buffer offset. The World Map and the frame after Options still showed only
+  small marks where the labels should be.
+- Direct Metal mesh draws now apply the guest vertex offset. With
+  `KYTY_MESH_CAPTURE_HASH=0dc508aff99ad4f4 KYTY_MESH_CAPTURE_FLIP=1560`,
+  the first eight draws previously repeated one quad. They now select records
+  0, 2, 4, …, 14. The first two texture rectangles are 33×31 and 26×26.
+  The first glyph's guest input spans x = −1.9872 to 2.1728 and the next
+  starts at −1.62369. Applying the captured matrix reproduces the Metal
+  clip coordinates (−1806.22 and −1805.47 for the two left edges, w = 2000).
+  This overlap is already present in the guest vertex records.
+- The font library accepted layout scales of 10,000×10,000 and 9,000×7,500
+  but measured advances at its 128-pixel bitmap limit. Layout now uses the
+  font outline and requested X/Y scales. Bitmap allocation remains bounded.
+  On the M4, the first two left edges moved from −1806.22/−1805.47 to
+  −1803.95/−1744.82 in clip space. The selection screen now shows “World Map”
+  and “Music Rally”, and the header shows “Credits” and “Daily Workout”.
+  Character spacing remains uneven. The sidebar from the PS5 reference was
+  not visible in either selection-screen capture.
+- The first 512×512 sky cubemap at `0x926f750000` contains six written faces.
+  `dd8467798edade1b` samples the GPU-written array. Cloud detail is visible on
+  the horizon faces. To reproduce the capture, use
+  `KYTY_DUMP_RT_DRAW=920ec00000,dd8467798edade1b,0,1` and
+  `KYTY_DUMP_RT_ARRAY_ADDRESS=926f750000`.
+- At guest flip 1560, composition shader `4aa7c29794420db2` received a scene
+  with 4,621 nonblack samples out of 10,944 in the sky region. Its color
+  attachment 1 had zero nonblack samples in the same region. The sample spans
+  20–80% of frame width and 8–22% of frame height at an eight-pixel stride.
+  An ordered GPU copy of the shared color input produced the same sky result.
+  The effect therefore persisted with the shader sampling a separate texture.
+- In a separate run, the shader probe
+  `KYTY_PS_PROBE=vars KYTY_PROBE_HASH=0x4aa7c29794420db2` with
+  `KYTY_PROBE_VARS='v215;v216,v201,v243'` exported the sampled scene red,
+  red transmission factor and short-path predicate to the three channels of
+  attachment 1. All 4,621 nonblack sky samples had RGB (2, 0, 255) in the
+  8-bit capture. The incoming color is sampled in this pass, and the
+  transmission from volume input 3 falls below the capture's precision.
+  In the sampled terrain region, the transmission channel was near white.
+- The spatial filter `d2a8505196a1078e` replaces the center column of the
+  transmission volume at `0x923fd60000`. Its input at `0x9240e40000` has
+  three integrated slices followed by 125 values of 64,512, the shader's
+  explicit end marker. In this scene the center lies inside the 600-unit near
+  boundary of the integration range. This column alone cannot locate a fault.
+- The Metal translator now uses the integer mip operand for sampled image reads.
+  The depth integration shader reads mip 3. The compute binder now retains
+  the GPU-written 11-level R16F pyramid at `0x924f1c0000` for the consumer.
+  With the corrected level alone, all 9,504 sampled points in the mountain
+  band were near-black. With the GPU-written pyramid, none were near-black
+  and mean luminance was 33.08/255. This comparison covers 20–80% of width
+  and 16–28% of height at an eight-pixel stride in two 3840×2160 M4 captures.
+  The mountains are visible, the sky is black, and the beach is bright.
+- Set `KYTY_DUMP_VOLUME_PROFILE=924f1c0000 KYTY_DUMP_RT_MIN_FLIP=1500` to
+  sample the pyramid after each distinct compute kernel. At mip 3 the consumer
+  saw −3498, −488.25 and +254.5 down the centerline (1/8, 4/8, 7/8 of height).
+  The integration shader takes the absolute value. The three magnitudes
+  decrease from the horizon toward the foreground.

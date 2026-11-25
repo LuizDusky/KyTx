@@ -715,13 +715,14 @@ static void RecordComputeStorage(uint64_t addr, id<MTLTexture> tex, Prospero::Ti
 // that writer produced, not an older object the registry still holds for the address: the game reuses addresses for unrelated
 // surfaces within one frame (a compute-written image earlier, the lit scene render target later), and a stale entry fed the tonemap
 // kernel garbage. KYTY_NO_LAST_WRITER=1 restores the registry-first order.
-static id<MTLTexture> LastGpuWriterTexture(uint64_t addr, uint64_t* out_flip = nullptr) {
+static id<MTLTexture> LastGpuWriterTexture(uint64_t addr, uint64_t* out_flip = nullptr, Prospero::TileMode* out_tile = nullptr) {
 	static const bool s_off = KYTY_ENV("KYTY_NO_LAST_WRITER") != nullptr;
 	if (s_off || addr == 0) return nil;
 	std::lock_guard<std::mutex> lock(s_cs_storage_mutex);
 	const auto it = s_cs_storage.find(addr);
 	if (it == s_cs_storage.end()) return nil;
 	if (out_flip != nullptr) *out_flip = it->second.flip;
+	if (out_tile != nullptr) *out_tile = it->second.tile;
 	return it->second.tex;
 }
 
@@ -7924,9 +7925,14 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 						}
 					}
 					if (texture == nil && !storage) {
-						if (id<MTLTexture> last = LastGpuWriterTexture(addr)) {
+						Prospero::TileMode writer_tile {};
+						if (id<MTLTexture> last = LastGpuWriterTexture(addr, nullptr, &writer_tile)) {
 							const MTLPixelFormat want_fmt = MetalFormatFromBufferFormat(tex.Format());
-							if (last.width == w && last.height == h && last.mipmapLevelCount == 1 && last.textureType == MTLTextureType2D &&
+							// A compute-written mip pyramid lives on the GPU. The guest backing can still be empty.
+							const bool matching_pyramid = tex.LastLevel() > 0 && tex.Type() == Prospero::ImageType::kColor2D &&
+							    last.mipmapLevelCount > tex.LastLevel() && writer_tile == tex.TileMode() && last.pixelFormat == want_fmt;
+							if (last.width == w && last.height == h && (matching_pyramid || last.mipmapLevelCount == 1) &&
+							    last.textureType == MTLTextureType2D &&
 							    (CanSampleDepthAsFloat(last.pixelFormat, want_fmt) || SameTexelSize(last, want_fmt))) {
 								texture = CanSampleDepthAsFloat(last.pixelFormat, want_fmt) ? last : ReinterpretFormat(last, want_fmt);
 								via = "lastwriter";
@@ -8060,10 +8066,12 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 						}
 					}
 					{
-					if (volume_address && addr == volume_address && storage && TraceWindow::g_flip.load() >= volume_flip &&
-					    !profiled_volume_writers.contains(cs_hash) &&
-					    texture.textureType == MTLTextureType3D && texture.pixelFormat == MTLPixelFormatRG11B10Float &&
-					    texture.storageMode == MTLStorageModeShared) volume_output = texture;
+					if (volume_address && addr == volume_address && TraceWindow::g_flip.load() >= volume_flip &&
+					    !profiled_volume_writers.contains(cs_hash) && texture.storageMode == MTLStorageModeShared &&
+					    ((storage && texture.textureType == MTLTextureType3D && texture.pixelFormat == MTLPixelFormatRG11B10Float) ||
+					     (texture.textureType == MTLTextureType2D && texture.pixelFormat == MTLPixelFormatR16Float))) {
+						volume_output = texture;
+					}
 					// KYTY_LOG_CS_ADDR=<guest address>: every compute image bound at that address (which kernels read/write it).
 						// KYTY_LOG_CS_STORES=1: once per (kernel, resource, address, size, format) every compute image that is written - names the kernel
 						// behind each image of a KYTY_DUMP_IMG dump.
@@ -8729,9 +8737,24 @@ void MetalRenderer::DispatchCompute(uint64_t submit_id, const HW::Context& conte
 		profiled_volume_writers.insert(cs_hash);
 		(void)MetalContext::Instance().GetCurrentCommandBuffer();
 		MetalContext::Instance().CommitCommandBuffer(true);
-		std::fprintf(stderr, "[VolumeWriter] hash=%016llx groups=%u,%u,%u", (unsigned long long)cs_hash,
+		std::fprintf(stderr, "[%s] hash=%016llx groups=%u,%u,%u",
+		             volume_output.textureType == MTLTextureType3D ? "VolumeWriter" : "MipSamples", (unsigned long long)cs_hash,
 		             thread_group_x, thread_group_y, thread_group_z);
-		DumpVolumeColumn(volume_output);
+		if (volume_output.textureType == MTLTextureType3D) {
+			DumpVolumeColumn(volume_output);
+		} else {
+			for (NSUInteger level = 0; level < volume_output.mipmapLevelCount; ++level) {
+				const NSUInteger w = std::max<NSUInteger>(1, volume_output.width >> level);
+				const NSUInteger h = std::max<NSUInteger>(1, volume_output.height >> level);
+				std::fprintf(stderr, " mip%lu=", (unsigned long)level);
+				for (unsigned row: {1u, 4u, 7u}) {
+					uint16_t bits = 0;
+					[volume_output getBytes:&bits bytesPerRow:2 fromRegion:MTLRegionMake2D(w / 2, h * row / 8, 1, 1) mipmapLevel:level];
+					std::fprintf(stderr, "%g,", DumpHalfToFloat(bits));
+				}
+			}
+			std::fputc('\n', stderr);
+		}
 		const auto& words = compute_info.stage.resources->flattened_srt;
 		std::fprintf(stderr, "[VolumeConstants] hash=%016llx words:", (unsigned long long)cs_hash);
 		for (size_t i = 0; i < std::min<size_t>(words.size(), 128); ++i) std::fprintf(stderr, " %08x", words[i]);

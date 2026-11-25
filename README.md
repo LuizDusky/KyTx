@@ -49,13 +49,34 @@ Package reader** to select a helper elsewhere. The helper and its dependencies
 are separate from the launcher. A game-specific JSON patch can be selected in
 **Game Options**.
 
-## Development notes
+## Development priorities
 
-Diagnostic switches are environment variables documented next to their code (for example `KYTY_PASS_TRACE_*`,
-`KYTY_GPU_BUSY`, `KYTY_GPU_PASS_TIME` in `src/graphics/host_gpu/metal/`). The upstream KytyPS5 documentation is in
-[`docs/`](docs/).
+The following areas are proposed priorities for improving the project:
+
+- [ ] Document a reproducible ARM64 build and external FEX dependency setup.
+- [ ] Improve shader translation and rendering correctness.
+- [ ] Investigate GPU hangs and runtime stability.
+- [ ] Establish repeatable compatibility and performance tests.
+- [ ] Expand testing across Apple Silicon hardware and additional titles.
+
+Diagnostic environment variables, including `KYTY_PASS_TRACE_*`, `KYTY_GPU_BUSY` and `KYTY_GPU_PASS_TIME`, are documented alongside the implementation. Inherited documentation is available in [`docs/`](docs/).
+
+## Contributing
+
+Contributions to graphics correctness, CPU integration, build reproducibility and documentation are welcome.
+
+Before submitting a change, describe the problem, keep the patch focused and include reproduction steps or test results where possible. For a bug report, include the macOS version, Apple Silicon model, memory configuration, commit SHA, relevant logs and expected versus actual behavior.
+
+- [Report an issue](https://github.com/LuizDusky/Prospero/issues)
+- [Browse pull requests](https://github.com/LuizDusky/Prospero/pulls)
+
+Do not attach copyrighted game files, firmware, keys or other material you are not authorized to distribute.
 
 ## Credits
+
+Prospero builds on the work of the open-source emulation community:
+
+- [KyTx](https://github.com/TxCsOffc/KyTx), the immediate upstream project.
 
 - [Kyty](https://github.com/InoriRus/Kyty) by InoriRus and contributors.
 - [KytyPS5](https://github.com/KytyPS5/KytyPS5) and its contributors.
@@ -64,4 +85,10 @@ Diagnostic switches are environment variables documented next to their code (for
 
 ## License
 
-GPL-2.0, as upstream. See [`LICENSE`](LICENSE) and [`LICENSES/`](LICENSES/).
+GPL-2.0, as upstream. See [LICENSE](LICENSE) and [LICENSES/](LICENSES/) for licensing details.
+
+Prospero is an independent project and is not affiliated with Sony Interactive Entertainment, PlayStation or any game publisher. It does not distribute games, game data or copyrighted system software. Use only game files you have obtained legally.
+
+---
+
+<p align="center"><sub>Prospero · Experimental native PS5 emulation for Apple Silicon</sub></p>

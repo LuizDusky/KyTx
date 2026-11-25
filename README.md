@@ -1,6 +1,10 @@
-# KyTx
+<p align="center">
+  <img src="docs/branding/prospero.svg" alt="Prospero — native PlayStation 5 emulation for Apple Silicon" width="720"/>
+</p>
 
-**KyTx** is an experimental PlayStation 5 emulator for **macOS on Apple Silicon**, built on
+# Prospero
+
+**Prospero** is an experimental PlayStation 5 emulator for **macOS on Apple Silicon**, built on
 [KytyPS5](https://github.com/KytyPS5/KytyPS5) (itself based on [Kyty](https://github.com/InoriRus/Kyty)).
 It replaces the upstream x86-64 + Rosetta 2 + MoltenVK setup with a native ARM64 build:
 
@@ -11,7 +15,7 @@ It replaces the upstream x86-64 + Rosetta 2 + MoltenVK setup with a native ARM64
   inherited Vulkan renderer is kept only as a diagnostic reference.
 
 > [!IMPORTANT]
-> KyTx is not affiliated with Sony Interactive Entertainment, PlayStation or any game publisher. The project does not
+> Prospero is not affiliated with Sony Interactive Entertainment, PlayStation or any game publisher. The project does not
 > distribute games, game data or copyrighted system software. Use only game files that you have obtained legally.
 
 ## Status
@@ -24,7 +28,7 @@ Early and unstable. Only one title has been worked on so far:
 
 Nothing else has been tested on this fork, including UFC 5 (the target of the fork this one started from).
 
-- **Platforms:** macOS on Apple Silicon only. There are no Windows or Linux builds of KyTx; the upstream code for those
+- **Platforms:** macOS on Apple Silicon only. There are no Windows or Linux builds of Prospero; the upstream code for those
   platforms is still in the tree but is not built or tested here.
 - **Requirements:** an Apple Silicon Mac with a Metal 4 capable GPU (developed on an M5 Max, 48 GB).
 

@@ -893,13 +893,6 @@ struct Emitter {
 		return declared != 0 ? declared : 8192u;
 	}
 
-	[[nodiscard]] bool UsesDeviceLds() const {
-		const auto* cs = input_info.compute;
-		return program.stage == ShaderType::Compute && cs != nullptr &&
-		       cs->metal_threadgroup_limit_dwords != 0 &&
-		       LdsDwords() > cs->metal_threadgroup_limit_dwords && UsesLds();
-	}
-
 	[[nodiscard]] bool UsesLds() const {
 		for (const auto& info: program.memory_info) {
 			if (info.kind == IR::ResourceKind::Lds || (info.kind == IR::ResourceKind::Gds && !GdsMem(info))) {

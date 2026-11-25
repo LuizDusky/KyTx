@@ -2023,7 +2023,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		Metal::MetalRenderer::Instance().DrawAuto(
 		    m_submit_id, m_ctx, m_sh_ctx, m_ucfg, m_renderer.GetPipelineCache(),
 		    m_ucfg.GetPrimType(), args.vertex_count, args.instance_count,
-		    args.first_vertex, args.first_instance);
+		    args.first_vertex, args.first_instance, args.offset_source == DrawOffsetSource::DrawState);
 		return;
 	}
 #endif

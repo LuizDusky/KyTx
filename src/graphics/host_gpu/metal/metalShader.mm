@@ -37,7 +37,7 @@ static std::unordered_set<uint64_t> s_arg_buffer0_hashes;
 static void RecordArgBuffer0(uint64_t hash) { s_arg_buffer0_hashes.insert(hash); }
 bool ShaderHasArgumentBuffer0(uint64_t hash) { return s_arg_buffer0_hashes.count(hash) != 0; }
 
-// KYTY_PS_PROBE=alpha1|uv|tex|cb: diagnostic rewrite of fragment entry returns.
+// KYTY_PS_PROBE=alpha1|uv|tex|cb|coverage: diagnostic rewrite of fragment entry returns.
 // Overwrites the [[color(0)]] output with a known value before each `return out;`.
 static std::string PsIdentBefore(const std::string& s, size_t end) {
 	size_t e = end;
@@ -138,6 +138,31 @@ static void ApplyVsDbg(std::string& msl, uint64_t hash) {
 	std::fprintf(stderr, "[VsDbg] hash=0x%016llx vid=%s pos=%s returns=%d\n", (unsigned long long)hash, vid.c_str(), pos.c_str(), n);
 }
 
+// Record the first mesh group's counts, clip coordinates, and UVs after guest exports.
+static void ApplyMeshCapture(std::string& msl, uint64_t hash) {
+	const char* setting = KYTY_ENV("KYTY_MESH_CAPTURE_HASH");
+	if (setting == nullptr || std::strtoull(setting, nullptr, 16) != hash) return;
+	const std::string entry = "[[mesh]] void main0(";
+	const auto start = msl.find(entry);
+	const std::string boundary = "if (spvMeshSizes.y == 0)";
+	const auto export_end = msl.find(boundary, start);
+	if (start == std::string::npos || export_end == std::string::npos ||
+	    msl.find("threadgroup float4 gl_Position[", start) == std::string::npos) return;
+	const bool has_uv = msl.find("threadgroup float4 out_param_1[", start) != std::string::npos;
+	std::string probe = "if (kyty_mesh_capture[0] != 0u && gl_LocalInvocationIndex == 0u && all(gl_WorkGroupID == uint3(0))) {\n"
+	                    "    kyty_mesh_capture[1] = spvMeshSizes.x;\n"
+	                    "    kyty_mesh_capture[2] = spvMeshSizes.y;\n"
+	                    "    for (uint i = 0; i < min(spvMeshSizes.x, 4u); ++i) {\n"
+	                    "        uint offset = 4u + i * 8u;\n"
+	                    "        uint4 pos = as_type<uint4>(gl_Position[i]);\n"
+	                    "        for (uint c = 0; c < 4; ++c) kyty_mesh_capture[offset + c] = pos[c];\n";
+	if (has_uv) probe += "        kyty_mesh_capture[offset + 4u] = as_type<uint>(out_param_1[i].x);\n"
+	                     "        kyty_mesh_capture[offset + 5u] = as_type<uint>(out_param_1[i].y);\n";
+	probe += "    }\n}\n    ";
+	msl.insert(export_end, probe);
+	msl.insert(start + entry.size(), "device uint* kyty_mesh_capture [[buffer(27)]], ");
+}
+
 // KYTY_PROBE_HASH is one hash or a comma-separated list (pixel shader probes only).
 static bool ProbeHashListed(const char* list, uint64_t hash) {
 	for (const char* p = list; *p != '\0';) {
@@ -208,7 +233,7 @@ static void ApplyPsProbe(std::string& msl, uint64_t hash) {
 		const std::string tex = "spvDescriptorSet0." + PsIdentBefore(msl, id) + "[0u]";
 		inject = "out." + color + " = float4(float(" + tex + ".get_width()) / 2048.0, float(" + tex +
 		         ".get_height()) / 2048.0, 0.0, 1.0); ";
-	} else if (mode == "red") {
+	} else if (mode == "red" || mode == "coverage") {
 		inject = "out." + color + " = float4(1.0, 0.0, 0.0, 1.0); ";
 	} else if (mode == "alpha1") {
 		inject = "out." + color + ".w = 1.0; ";
@@ -319,6 +344,14 @@ static void ApplyPsProbe(std::string& msl, uint64_t hash) {
 		msl.insert(pos, inject);
 		pos += inject.size() + ret.size();
 		++injected;
+	}
+	if (mode == "coverage") {
+		// Red marks a normal return above. Blue marks a fragment discarded by the shader.
+		const std::string discard = "discard_fragment();";
+		const std::string mark = "{ out." + color + " = float4(0.0, 0.0, 1.0, 1.0); return out; }";
+		for (pos = msl.find(discard, frag); pos != std::string::npos; pos = msl.find(discard, pos + mark.size())) {
+			msl.replace(pos, discard.size(), mark);
+		}
 	}
 	static std::atomic<uint32_t> s_probe_log {0};
 	if (s_probe_log.fetch_add(1) < 20) {
@@ -453,10 +486,11 @@ void MetalShaderManager::ClearCache() {
 
 // MSL disk cache key: schema version (bump when translator/sanitizer output changes) and
 // probe mode, so stale or probed entries are never reused across builds or experiments.
-static constexpr const char* kMslCacheSchema = "msl-s2";
+static constexpr const char* kMslCacheSchema = "msl-s3";
 
 static bool MslDiskCacheDisabled() {
 	static const bool s_off = KYTY_ENV("KYTY_MSL_NO_DISK_CACHE") != nullptr ||
+	                          KYTY_ENV("KYTY_MESH_CAPTURE_HASH") != nullptr ||
 	                          KYTY_ENV("KYTY_PS_PROBE") != nullptr ||
 	                          KYTY_ENV("KYTY_VS_PROBE") != nullptr ||
 	                          KYTY_ENV("KYTY_SPVC_ABI") != nullptr ||
@@ -703,6 +737,7 @@ MetalShaderCompileResult MetalShaderManager::CompileSpirvToFunction(
 		result.msl_source = SanitizeMslSource(compiler.compile());
 		if (mesh_stage) {
 			PackMeshTriangleIndices(result.msl_source);
+			ApplyMeshCapture(result.msl_source, shader_hash);
 			if (KYTY_ENV("KYTY_METAL_MESH_SINGLE_LAYER") != nullptr) {
 				static const std::regex layer_output(R"(spvP\.gl_Layer = [^;]+;)");
 				result.msl_source = std::regex_replace(result.msl_source, layer_output, "spvP.gl_Layer = 0u;");

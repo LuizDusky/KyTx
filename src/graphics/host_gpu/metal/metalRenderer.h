@@ -52,7 +52,7 @@ public:
 	              const HW::UserConfig& ucfg, PipelineCache& pipeline_cache,
 	              Prospero::PrimitiveType prim_type,
 	              uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
-	              uint32_t first_instance);
+	              uint32_t first_instance, bool use_draw_state_offsets);
 
 	void DispatchDirect(uint64_t submit_id, const HW::Context& context, const HW::Shader& sh_ctx,
 	                    PipelineCache& pipeline_cache, uint32_t thread_group_x,
